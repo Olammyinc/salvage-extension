@@ -1,0 +1,37 @@
+# Internal tooling and project state
+.ijfw/
+ijfw/
+.ijfw-*/
+
+# Editor and IDE state
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Playwright / MCP / wayland artifacts
+.playwright-mcp/
+.wayland-core/
+
+# Build and package artifacts
+*.zip
+*.crx
+*.pem
+node_modules/
+dist/
+
+# Test output (keep test source, ignore results)
+test-results/
+coverage/
+
+# Secrets and environment
+.env
+.env.*
+*.pem
+*.key

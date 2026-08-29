@@ -1,0 +1,1 @@
+A local bookmark cleanup extension for Chrome and Edge.
