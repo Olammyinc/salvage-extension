@@ -1,0 +1,27 @@
+- generic [active] [ref=e2]:
+  - banner [ref=e3]:
+    - generic [ref=e4]:
+      - heading "Extensions" [level=1] [ref=e9]
+      - generic [ref=e12]:
+        - button [ref=e13] [cursor=pointer]
+        - generic [ref=e14]:
+          - generic [ref=e15]: Search extensions
+          - searchbox "Search extensions" [ref=e16]
+      - generic [ref=e19]:
+        - generic [ref=e20]: Developer mode
+        - button "Developer mode" [ref=e21] [cursor=pointer]
+  - generic [ref=e24]:
+    - navigation [ref=e26]:
+      - menu [ref=e27]:
+        - generic:
+          - menuitem "My extensions" [ref=e28] [cursor=pointer]
+          - menuitem "Keyboard shortcuts" [ref=e29] [cursor=pointer]
+      - generic [ref=e32]:
+        - text: Discover more extensions and themes on the
+        - link "Chrome Web Store" [ref=e33] [cursor=pointer]:
+          - /url: https://chromewebstore.google.com/category/extensions?utm_source=ext_sidebar&hl=en-GB
+    - main [ref=e34]:
+      - generic [ref=e39]:
+        - text: Find extensions and themes in the
+        - link "Chrome Web Store" [ref=e40] [cursor=pointer]:
+          - /url: https://chrome.google.com/webstore/category/extensions

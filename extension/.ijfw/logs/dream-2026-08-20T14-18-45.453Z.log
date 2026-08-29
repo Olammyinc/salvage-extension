@@ -1,0 +1,7 @@
+[2026-08-20T14:18:45.469Z] start: host=claude-code, reason=session_end, project=C:/Users/HP/OneDrive/Documents/Olammyinc/olammyju/olammy/projects/paul/bookmark/extension
+[2026-08-20T14:18:45.518Z] journal: 1 entries across 1 sessions
+[2026-08-20T14:18:46.158Z] tier-promotion: db open skipped (Cannot find package 'better-sqlite3' imported from C:\Users\HP\.ijfw\mcp-server\src\memory\fts5.js)
+[2026-08-20T14:18:46.315Z] wiki-compile: db open skipped (Cannot find package 'better-sqlite3' imported from C:\Users\HP\.ijfw\mcp-server\src\memory\fts5.js)
+[2026-08-20T14:18:46.835Z] profile_derive: merged delta (style=0 feedback=0 inferences=1)
+[2026-08-20T14:18:47.041Z] mark-completed: ok
+[2026-08-20T14:18:47.159Z] end: completed=5 failed=0
