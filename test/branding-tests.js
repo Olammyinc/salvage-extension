@@ -130,8 +130,13 @@ check('browser_specific_settings.gecko.id is set (AMO requirement)',
   'id=' + (manifest.browser_specific_settings && manifest.browser_specific_settings.gecko &&
     manifest.browser_specific_settings.gecko.id));
 check('gecko strict_min_version >= 121 (service_worker ignored from 121)',
-  typeof (manifest.browser_specific_settings && manifest.browser_specific_settings.gecko &&
-    manifest.browser_specific_settings.gecko.strict_min_version) === 'string',
+  (() => {
+    const raw = manifest.browser_specific_settings && manifest.browser_specific_settings.gecko &&
+      manifest.browser_specific_settings.gecko.strict_min_version;
+    if (typeof raw !== 'string') { return false; }
+    const major = parseInt(raw.split('.')[0], 10);
+    return Number.isFinite(major) && major >= 121;
+  })(),
   'min=' + (manifest.browser_specific_settings && manifest.browser_specific_settings.gecko &&
     manifest.browser_specific_settings.gecko.strict_min_version));
 check('all required permissions are declared',
@@ -148,6 +153,64 @@ const bgPath = path.join(root, 'background', 'service-worker.js');
 const bgSrc = fs.readFileSync(bgPath, 'utf8');
 check('background script uses importScripts (works in both Chrome SW and Firefox event page)',
   /importScripts\s*\(/.test(bgSrc), '');
+
+// ---- Firefox event-page compatibility assertions ----------------------------
+// Firefox MV3 (121+) runs background.scripts as an event page, not a service
+// worker. The code must avoid service-worker-only APIs and lifecycle
+// assumptions. These assertions guard against accidental introduction of
+// incompatible patterns.
+console.log('[background] Firefox event-page compatibility');
+
+// Collect source of all modules loaded by importScripts so we can scan them
+// for incompatible patterns.
+const importScriptModules = [];
+const importMatch = bgSrc.match(/importScripts\s*\(([\s\S]*?)\)/);
+if (importMatch) {
+  const entries = importMatch[1].split(',');
+  for (const entry of entries) {
+    const trimmed = entry.trim().replace(/['"]/g, '');
+    if (trimmed) {
+      const modPath = path.join(root, 'background', trimmed);
+      if (fs.existsSync(modPath)) {
+        importScriptModules.push({ rel: trimmed, src: fs.readFileSync(modPath, 'utf8') });
+      } else {
+        // ../shared/... relative to background/
+        const altPath = path.join(root, trimmed);
+        if (fs.existsSync(altPath)) {
+          importScriptModules.push({ rel: trimmed, src: fs.readFileSync(altPath, 'utf8') });
+        }
+      }
+    }
+  }
+}
+
+const allBgSrc = bgSrc + '\n' + importScriptModules.map((m) => m.src).join('\n');
+
+// 1. No service-worker-only global APIs
+check('no self.skipWaiting (SW-only)', !/\bself\.skipWaiting\b/.test(allBgSrc), '');
+check('no self.clients (SW-only)', !/\bself\.clients\b/.test(allBgSrc), '');
+check('no self.registration (SW-only)', !/\bself\.registration\b/.test(allBgSrc), '');
+
+// 2. No service-worker lifecycle event listeners
+check('no addEventListener("activate"', !/addEventListener\s*\(\s*['"]activate['"]/.test(allBgSrc), '');
+check('no addEventListener("install"', !/addEventListener\s*\(\s*['"]install['"]/.test(allBgSrc), '');
+check('no addEventListener("fetch"', !/addEventListener\s*\(\s*['"]fetch['"]/.test(allBgSrc), '');
+
+// 3. State is persisted in chrome.storage (not relying on SW global scope survival)
+check('background uses chrome.storage for persistence',
+  /chrome\.storage\.local\.(get|set)\b/.test(allBgSrc), '');
+
+// 4. Alarms are used for wake/scheduling (event-page-compatible keepalive pattern)
+check('background uses chrome.alarms for scheduling (event-page wake pattern)',
+  /chrome\.alarms\.(create|clear|onAlarm)\b/.test(allBgSrc), '');
+
+// 5. Event listeners use chrome.runtime.on* (available in both SW and event page)
+check('background registers onInstalled listener',
+  /chrome\.runtime\.onInstalled\.addListener/.test(bgSrc), '');
+check('background registers onMessage listener',
+  /chrome\.runtime\.onMessage\.addListener/.test(bgSrc), '');
+check('background registers onAlarm listener',
+  /chrome\.alarms\.onAlarm\.addListener/.test(bgSrc), '');
 
 console.log(failures === 0 ? 'branding OK' : 'branding FAILED (' + failures + ')');
 process.exitCode = failures > 0 ? 1 : 0;
