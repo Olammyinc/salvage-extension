@@ -4,6 +4,12 @@
   "version": "0.2.0",
   "description": "__MSG_extensionDescription__",
   "default_locale": "en",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "salvage@olammyinc.github.io",
+      "strict_min_version": "121.0"
+    }
+  },
   "permissions": [
     "bookmarks",
     "storage",
@@ -14,6 +20,7 @@
     "<all_urls>"
   ],
   "background": {
+    "scripts": ["background/service-worker.js"],
     "service_worker": "background/service-worker.js"
   },
   "action": {

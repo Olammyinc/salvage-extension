@@ -106,5 +106,48 @@ const leaked = Object.keys(c.COPY).filter(
 check('no string copy value equals the listing title', leaked.length === 0,
   'keys=' + JSON.stringify(leaked));
 
+// ---- Firefox cross-browser compatibility ------------------------------------
+// MDN recommends specifying both "scripts" and "service_worker" in the
+// background key for cross-browser MV3 support. Chrome uses service_worker;
+// Firefox (121+) ignores service_worker and uses scripts. A single manifest
+// works in both browsers without a separate build path.
+console.log('[manifest] Firefox cross-browser background support');
+check('manifest_version is 3', manifest.manifest_version === 3, 'got ' + manifest.manifest_version);
+check('background.scripts is present (for Firefox)',
+  Array.isArray(manifest.background && manifest.background.scripts) &&
+  manifest.background.scripts.length > 0, '');
+check('background.service_worker is present (for Chrome)',
+  typeof (manifest.background && manifest.background.service_worker) === 'string' &&
+  manifest.background.service_worker.length > 0, '');
+check('background.scripts and service_worker point to the same file',
+  manifest.background.scripts[0] === manifest.background.service_worker,
+  'scripts=' + (manifest.background && manifest.background.scripts && manifest.background.scripts[0]) +
+  ' service_worker=' + (manifest.background && manifest.background.service_worker));
+check('browser_specific_settings.gecko.id is set (AMO requirement)',
+  typeof (manifest.browser_specific_settings && manifest.browser_specific_settings.gecko &&
+    manifest.browser_specific_settings.gecko.id) === 'string' &&
+  manifest.browser_specific_settings.gecko.id.length > 0,
+  'id=' + (manifest.browser_specific_settings && manifest.browser_specific_settings.gecko &&
+    manifest.browser_specific_settings.gecko.id));
+check('gecko strict_min_version >= 121 (service_worker ignored from 121)',
+  typeof (manifest.browser_specific_settings && manifest.browser_specific_settings.gecko &&
+    manifest.browser_specific_settings.gecko.strict_min_version) === 'string',
+  'min=' + (manifest.browser_specific_settings && manifest.browser_specific_settings.gecko &&
+    manifest.browser_specific_settings.gecko.strict_min_version));
+check('all required permissions are declared',
+  Array.isArray(manifest.permissions) &&
+  ['bookmarks', 'storage', 'alarms', 'activeTab'].every((p) => manifest.permissions.indexOf(p) !== -1),
+  'permissions=' + JSON.stringify(manifest.permissions));
+check('optional_host_permissions is present for link checking',
+  Array.isArray(manifest.optional_host_permissions) &&
+  manifest.optional_host_permissions.indexOf('<all_urls>') !== -1, '');
+
+// Verify the background script file exists and uses importScripts (works in both
+// service worker and Firefox event page contexts).
+const bgPath = path.join(root, 'background', 'service-worker.js');
+const bgSrc = fs.readFileSync(bgPath, 'utf8');
+check('background script uses importScripts (works in both Chrome SW and Firefox event page)',
+  /importScripts\s*\(/.test(bgSrc), '');
+
 console.log(failures === 0 ? 'branding OK' : 'branding FAILED (' + failures + ')');
 process.exitCode = failures > 0 ? 1 : 0;
