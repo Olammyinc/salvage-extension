@@ -1,5 +1,5 @@
 /**
- * Runtime- message boundary checks (Milestone 3, defence in depth).
+ * Runtime message boundary checks (defence in depth).
  *
  * Pure, chrome-free helpers used by the background service worker to gate the
  * runtime message boundary before any message is acted on, plus the explicit

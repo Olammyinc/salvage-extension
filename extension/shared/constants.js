@@ -43,14 +43,14 @@
     RECORDS: 'records',
     REPORT: 'report',
     LAST_SCAN: 'lastScanAt',
-    // Milestone 2 detection: folder findings (empty folders + merge candidates)
+    // Detection: folder findings (empty folders + merge candidates)
     // derived from a read-only tree snapshot, plus the link-check lifecycle
     // (its own checkpoint and its result summary). Link statuses themselves are
     // written back on each record (linkStatus / linkCheckedAt).
     FOLDER_FINDINGS: 'folderFindings',
     LINK_CHECKPOINT: 'linkCheckpoint',
     LINK_REPORT: 'linkReport',
-    // Milestone 3 safe cleanup: tracked Trash metadata is kept SEPARATE from the
+    // Safe cleanup: tracked Trash metadata is kept SEPARATE from the
     // live scan `records`. TRASH holds the tracked trash entries (original
     // parentId, title, url, originalIndex, kind, movedAt); TRASH_LAST_BATCH is
     // the durable record of the most recent bulk-move batch so a restarted MV3
@@ -70,7 +70,7 @@
   var SCHEMA_VERSION = 1;
 
   // Scan configuration ------------------------------------------------------
-  // ~75 links per chunk, per BUILD-HANDOFF.md and TECHNICAL-ARCHITECTURE.md.
+  // ~75 links per chunk.
   var CHUNK_SIZE = 75;
   var ALARM_NAME = 'scanner-wake';
   // The link check is a separate lifecycle from the library scan, so it owns a
@@ -91,7 +91,7 @@
   // window, never corrupts the scan. A small default keeps well under
   // Chrome's ~30 s idle kill.
   var ACTIVE_WINDOW_MS = 20000;
-  // Stale threshold: "not opened in over 2 years" (PRD 10.9).
+  // Stale threshold: "not opened in over 2 years".
   var STALE_YEARS = 2;
   var MILLIS_PER_DAY = 86400000;
   var DAYS_PER_YEAR = 365.25;
@@ -103,7 +103,8 @@
   var PHASE = {
     IDLE: 'idle',
     SCANNING: 'scanning',
-    DONE: 'done'
+    DONE: 'done',
+    FAILED: 'failed'
   };
 
   // Categorization behaviour ------------------------------------------------
@@ -111,7 +112,7 @@
   var CATEGORY_CONFIDENCE = 1; // rules match is exact by construction in M1
   // Neutral fallback category used when no domain/keyword rule matches.
   var DEFAULT_CATEGORY = 'Other';
-  var CATEGORIES_THIS_MILESTONE = [
+  var CATEGORIES = [
     'Development',
     'Recipes',
     'Travel',
@@ -125,7 +126,7 @@
     'Other'
   ];
 
-  // Link status: Milestone 2 adds a three-state result per FR5. Only a
+  // Link status: three-state result. Only a
   // confirmed dead response (404/410) may be `unreachable`; every other
   // failure — 401, 403, 429, 5xx, unresolved redirects, challenges, CORS and
   // timeout errors — is `could_not_check`. Successful 2xx responses (including
@@ -148,13 +149,13 @@
   var LINK_CHUNK_SIZE = 25;
   var LINK_ACTIVE_WINDOW_MS = 15000;
 
-  // Backup export configuration (Milestone 2) -------------------------------
+  // Backup export configuration -----------------------------------------------
   // A restorable JSON export is always complete (never partial, never gated).
   var BACKUP_SCHEMA = 'bookmark-library-backup';
   var BACKUP_VERSION = 1;
   var BACKUP_FILE_NAME = 'bookmark-library-backup.json';
 
-  // Milestone 3 safe cleanup -------------------------------------------------
+  // Safe cleanup ---------------------------------------------------------------
   // The user-approved, visible folder into which selected items are MOVED (never
   // deleted during normal cleanup), so browser-tree cleanup is fully reversible.
   var TRASH_FOLDER_NAME = 'Salvage Trash';
@@ -179,7 +180,7 @@
     TOP_CATEGORIES: 'topCategories',
     UNCATEGORIZED: 'uncategorized',
     GENERATED_AT: 'generatedAt',
-    // Milestone 2 detection fields. The count keys stay exact and neutral; the
+    // Detection fields. The count keys stay exact and neutral; the
     // *_LIST keys carry the read-only detail the popup renders behind each
     // count (never mutating anything).
     DUPLICATE_GROUPS_LIST: 'duplicateGroupsList',
@@ -256,6 +257,7 @@
     },
     scanStarting: 'Starting scan...',
     scanDone: 'Ready.',
+    scanFailed: 'Scan could not complete. Click Scan now to retry.',
 
     // Duration instrumentation copy: exposed next to the Library Report, using
     // the neutral formatter. The total and duration come from persisted data.
@@ -306,7 +308,7 @@
       return n + ' shown in this read-only list';
     },
 
-    // ---- Milestone 2 detection copy (backup export + cleanup findings) ------
+    // ---- Detection copy (backup export + cleanup findings) -------------------
     // Always-visible, never-gated backup export.
     backupButton: 'Back up library',
     backupDescription: 'Export your full bookmark tree as a JSON file you can restore from. The export is always complete.',
@@ -332,7 +334,7 @@
     },
     sameNameMergeCta: 'Review',
 
-    // ---- Milestone 2 link-check copy (opt-in, permission-gated) -------------
+    // ---- Link-check copy (opt-in, permission-gated) --------------------------
     linkCheckSection: 'Dead links',
     linkCheckButton: 'Check links',
     linkCheckExplain: 'Checking links sends a request to each bookmarked page. This needs temporary access and can take a while. Nothing is modified or deleted.',
@@ -355,7 +357,7 @@
       return 'Checked ' + checked + ' link' + (checked === 1 ? '' : 's') + ' in ' + formatDuration(durationMs);
     },
 
-    // ---- Milestone 3 cleanup copy (Salvage Trash) ----------------------------
+    // ---- Cleanup copy (Salvage Trash) -----------------------------------------
     // Cleanup selection / dry-run / confirmation.
     cleanupSelectForTrash: 'Select items to move to ' + TRASH_FOLDER_NAME,
     cleanupSelectedCta: function (n) { return 'Move ' + n + ' to ' + TRASH_FOLDER_NAME; },
@@ -425,7 +427,7 @@
     CATEGORY_SOURCE: CATEGORY_SOURCE,
     CATEGORY_CONFIDENCE: CATEGORY_CONFIDENCE,
     DEFAULT_CATEGORY: DEFAULT_CATEGORY,
-    CATEGORIES_THIS_MILESTONE: CATEGORIES_THIS_MILESTONE,
+    CATEGORIES: CATEGORIES,
     LINK_STATUS_UNCHECKED: LINK_STATUS_UNCHECKED,
     LINK_STATUS_REACHABLE: LINK_STATUS_REACHABLE,
     LINK_STATUS_UNREACHABLE: LINK_STATUS_UNREACHABLE,

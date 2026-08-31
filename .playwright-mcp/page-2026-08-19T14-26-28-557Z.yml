@@ -1,5 +1,0 @@
-- generic [active] [ref=f3e1]:
-  - heading "ServiceWorker" [level=1] [ref=f3e2]
-  - generic [ref=f3e5] [cursor=pointer]:
-    - checkbox "Open DevTools window and pause JavaScript execution on Service Worker startup for debugging." [ref=f3e6]
-    - generic [ref=f3e7]: Open DevTools window and pause JavaScript execution on Service Worker startup for debugging.

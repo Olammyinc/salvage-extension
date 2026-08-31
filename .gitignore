@@ -1,0 +1,22 @@
+# Root markdown -- only README.md is public
+/*.md
+!/README.md
+
+# Internal tooling and memory
+/.ijfw/
+/ijfw/
+/extension/.ijfw/
+
+# Test and build artifacts
+/.playwright-mcp/
+/.wayland-core/
+salvage-extension.zip
+
+# Marketing drafts (not part of the extension)
+/marketing/
+
+# Research validation files
+RESEARCH-VALIDATION-*.md
+
+# Real-browser test output
+extension/test/real-chrome-results.json

@@ -508,6 +508,172 @@ async function main() {
     'checkable=' + allOf(els['list-items'], (c) => c.tagName === 'input').length +
     ' remaining=' + remainingDupIds.length + ' initial=' + initialDupIds.length);
 
+  // --- Scenario J: FAILED scan phase -> Scan now enabled + actionable message --
+  // A scan that failed (storageSet rejection) must leave the Scan now button
+  // enabled so the user can retry, and show the actionable failure copy.
+  resetSeed({
+    [constants.KEYS.CHECKPOINT]: { phase: constants.PHASE.FAILED, totalCount: 100, processedCount: 0, updatedAt: NOW, error: 'quota exceeded' },
+    [constants.KEYS.REPORT]: null,
+    [constants.KEYS.RECORDS]: []
+  });
+  loadPopup(); await settle();
+  check('FAILED phase: Scan now button is enabled (not disabled like SCANNING)',
+    els['scan-btn'].disabled === false, 'disabled=' + els['scan-btn'].disabled);
+  check('FAILED phase: actionable failure message is shown',
+    els['status'].textContent === constants.COPY.scanFailed,
+    'status=' + els['status'].textContent);
+  check('FAILED phase: empty state is visible (no report)',
+    els['empty'].hidden === false, 'hidden=' + els['empty'].hidden);
+
+  // --- Scenario K: FAILED phase with prior report still shows report -----------
+  // If a scan fails mid-way but a prior report exists, the report is shown
+  // (the failed checkpoint is for the NEW scan, the old report is still valid).
+  resetSeed({
+    [constants.KEYS.CHECKPOINT]: { phase: constants.PHASE.FAILED, totalCount: 100, processedCount: 50, updatedAt: NOW, error: 'write rejected' }
+  });
+  loadPopup(); await settle();
+  check('FAILED with prior report: report is still rendered (not hidden)',
+    els['report'].hidden === false, 'reportHidden=' + els['report'].hidden);
+  check('FAILED with prior report: Scan now button is enabled',
+    els['scan-btn'].disabled === false, 'disabled=' + els['scan-btn'].disabled);
+
+  // --- Scenario L: requestScan callback after success/DONE re-enables button ---
+  // The scan-now request succeeds (worker returns {ok:true}) and the persisted
+  // checkpoint is already DONE (small library completed synchronously). The
+  // callback must re-enable Scan now so the button is not stuck disabled.
+  resetSeed({
+    [constants.KEYS.CHECKPOINT]: { phase: constants.PHASE.DONE, totalCount: 5, processedCount: 5, updatedAt: NOW }
+  });
+  messageHandler = (msg, cb) => {
+    if (msg.type === 'scan-now') { cb({ ok: true, skipped: false }); }
+    else { cb({ ok: true }); }
+  };
+  loadPopup(); await settle();
+  check('L precondition: Scan now is enabled before request',
+    els['scan-btn'].disabled === false, 'disabled=' + els['scan-btn'].disabled);
+  els['scan-btn'].fire('click');
+  await settle();
+  // After the callback, the persisted phase is DONE (not SCANNING), so the
+  // button must be re-enabled.
+  check('L: requestScan success callback re-enables Scan now when phase is DONE',
+    els['scan-btn'].disabled === false, 'disabled=' + els['scan-btn'].disabled);
+  check('L: scanRequestPending is cleared after callback',
+    els['status'].textContent !== constants.COPY.scanStarting ||
+    els['scan-btn'].disabled === false, 'status=' + els['status'].textContent);
+
+  // --- Scenario M: requestScan {ok:false} clears pending, enables button, shows failure ---
+  // The worker rejects the scan-now request (e.g. internal error) with no
+  // storage change. The popup must re-enable Scan now and show actionable
+  // failure copy so the user can retry.
+  resetSeed({
+    [constants.KEYS.CHECKPOINT]: { phase: constants.PHASE.DONE, totalCount: 10, processedCount: 10, updatedAt: NOW }
+  });
+  messageHandler = (msg, cb) => {
+    if (msg.type === 'scan-now') { cb({ ok: false, error: 'internal error' }); }
+    else { cb({ ok: true }); }
+  };
+  loadPopup(); await settle();
+  els['scan-btn'].fire('click');
+  await settle();
+  check('M: {ok:false} response re-enables Scan now button',
+    els['scan-btn'].disabled === false, 'disabled=' + els['scan-btn'].disabled);
+  check('M: {ok:false} response shows actionable failure message',
+    els['status'].textContent === constants.COPY.scanFailed,
+    'status=' + els['status'].textContent);
+
+  // --- Scenario N: requestScan with no response (null) also re-enables ---------
+  // A null/undefined response (e.g. runtime error, disconnected) must also
+  // clear pending and re-enable the button.
+  resetSeed({
+    [constants.KEYS.CHECKPOINT]: { phase: constants.PHASE.DONE, totalCount: 10, processedCount: 10, updatedAt: NOW }
+  });
+  messageHandler = (msg, cb) => {
+    if (msg.type === 'scan-now') { cb(null); }
+    else { cb({ ok: true }); }
+  };
+  loadPopup(); await settle();
+  els['scan-btn'].fire('click');
+  await settle();
+  check('N: null response re-enables Scan now button',
+    els['scan-btn'].disabled === false, 'disabled=' + els['scan-btn'].disabled);
+  check('N: null response shows actionable failure message',
+    els['status'].textContent === constants.COPY.scanFailed,
+    'status=' + els['status'].textContent);
+
+  // --- Scenario O: requestScan skipped (already SCANNING) keeps button disabled -
+  // When the worker returns {skipped:true} because the scan is already running,
+  // the callback receives {ok:true} but the persisted phase is SCANNING. The
+  // button must stay disabled (the storage-event handler will re-enable it when
+  // the scan reaches DONE).
+  resetSeed({
+    [constants.KEYS.CHECKPOINT]: { phase: constants.PHASE.SCANNING, totalCount: 100, processedCount: 50, updatedAt: NOW, scanStartedAt: NOW }
+  });
+  messageHandler = (msg, cb) => {
+    if (msg.type === 'scan-now') { cb({ ok: true, skipped: true, phase: constants.PHASE.SCANNING }); }
+    else { cb({ ok: true }); }
+  };
+  loadPopup(); await settle();
+  // The button should already be disabled because the persisted phase is SCANNING.
+  check('O precondition: Scan now is disabled during SCANNING',
+    els['scan-btn'].disabled === true, 'disabled=' + els['scan-btn'].disabled);
+  // Simulate a click (requestScan guards against SCANNING, so the click is
+  // a no-op — the button stays disabled). This verifies the guard path.
+  els['scan-btn'].fire('click');
+  await settle();
+  check('O: SCANNING phase keeps Scan now disabled (guard prevents request)',
+    els['scan-btn'].disabled === true, 'disabled=' + els['scan-btn'].disabled);
+
+  // --- Scenario P: skipped {ok:true, skipped:true, phase:SCANNING} with stale
+  //     non-scanning snapshot keeps button disabled. This is the race condition
+  //     where the popup opened before the scan started (snapshot.checkpoint is
+  //     DONE), the user clicks Scan now, but the worker already has a scan
+  //     running and returns skipped:true with the authoritative SCANNING phase.
+  //     The popup must use the returned phase (not the stale DONE snapshot) to
+  //     keep the button disabled until the scan completes.
+  resetSeed({
+    [constants.KEYS.CHECKPOINT]: { phase: constants.PHASE.DONE, totalCount: 10, processedCount: 10, updatedAt: NOW }
+  });
+  messageHandler = (msg, cb) => {
+    if (msg.type === 'scan-now') { cb({ ok: true, skipped: true, phase: constants.PHASE.SCANNING }); }
+    else { cb({ ok: true }); }
+  };
+  loadPopup(); await settle();
+  check('P precondition: Scan now is enabled (stale snapshot says DONE)',
+    els['scan-btn'].disabled === false, 'disabled=' + els['scan-btn'].disabled);
+  els['scan-btn'].fire('click');
+  await settle();
+  check('P: skipped response with phase:SCANNING keeps button disabled despite stale DONE snapshot',
+    els['scan-btn'].disabled === true, 'disabled=' + els['scan-btn'].disabled);
+
+  // --- Scenario Q: all-writes-reject -> {ok:false, phase:FAILED, error} from controller
+  //     The service-worker maps the controller's {failed:true} result to
+  //     {ok:false, phase:PHASE.FAILED, error}. The popup must handle this
+  //     WITHOUT a storage event: enable Scan now and show COPY.scanFailed.
+  resetSeed({
+    [constants.KEYS.CHECKPOINT]: { phase: constants.PHASE.DONE, totalCount: 10, processedCount: 10, updatedAt: NOW },
+    [constants.KEYS.REPORT]: { total: 10, generatedAt: NOW }
+  });
+  messageHandler = (msg, cb) => {
+    if (msg.type === 'scan-now') {
+      // Mirror the service-worker's exact output when all storageSet writes reject.
+      cb({ ok: false, phase: constants.PHASE.FAILED, error: 'total storage failure' });
+    } else { cb({ ok: true }); }
+  };
+  loadPopup(); await settle();
+  check('Q precondition: Scan now is enabled before request',
+    els['scan-btn'].disabled === false, 'disabled=' + els['scan-btn'].disabled);
+  els['scan-btn'].fire('click');
+  await settle();
+  check('Q: {ok:false, phase:FAILED} re-enables Scan now button',
+    els['scan-btn'].disabled === false, 'disabled=' + els['scan-btn'].disabled);
+  check('Q: {ok:false, phase:FAILED} shows actionable COPY.scanFailed',
+    els['status'].textContent === constants.COPY.scanFailed,
+    'status=' + els['status'].textContent);
+  // No storage event fired — the stored checkpoint is still DONE, not FAILED.
+  check('Q: no storage event needed (stored checkpoint unchanged)',
+    store[constants.KEYS.CHECKPOINT] && store[constants.KEYS.CHECKPOINT].phase === constants.PHASE.DONE,
+    'storedPhase=' + (store[constants.KEYS.CHECKPOINT] && store[constants.KEYS.CHECKPOINT].phase));
+
   console.log('\nPopup results: ' + (failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'));
   process.exitCode = failures === 0 ? 0 : 1;
 }

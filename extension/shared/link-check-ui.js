@@ -1,7 +1,7 @@
 /**
  * Dead-link checking — UI state resolution.
  *
- * Milestone 2 dead-link section, pure and deterministic.
+ * Dead-link section, pure and deterministic.
  *
  * The popup's link-check section must render exactly ONE state at a time —
  * idle (not checked), running (check in progress with a truthful

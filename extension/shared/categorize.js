@@ -4,7 +4,7 @@
  * Classifies a bookmark from its URL and title alone, using a shipped data
  * map (rules-data.json). This is tier 1 of the architecture: instant, free,
  * no API key, and enough to render the whole Library Report. Tier 2 (AI) is
- * explicitly out of scope for Milestone 1.
+ * explicitly out of scope.
  *
  * Matching order is fixed and deterministic: exact domain, then URL phrase,
  * then title phrase. The first rule that matches wins. When nothing matches,

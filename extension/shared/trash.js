@@ -1,5 +1,5 @@
 /**
- * Milestone 3 — safe cleanup / Salvage Trash.
+ * Safe cleanup / Salvage Trash.
  *
  * Two layers, deliberately separated so the hard data-safety rules live in
  * pure, chrome-free functions (unit-testable) while the chrome-bound

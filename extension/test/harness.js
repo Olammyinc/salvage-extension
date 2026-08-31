@@ -10,7 +10,7 @@
  *      away, no memory, resume reads storage only) and verifies the resumed
  *      scan completes with identical final counts;
  *   4. asserts idempotency: replaying the resume is harmless;
- *   5. asserts the checkpoint fields that Milestone 1 requires:
+ *   5. asserts the required checkpoint fields:
  *      lastProcessedId, processedCount, totalCount, phase;
  *   6. computes the Library Report and prints exact metrics.
  *
@@ -558,7 +558,7 @@ async function main() {
   // ---- Part 7: empty bookmark tree must not hang -----------------------------------
   // A library with zero bookmarks must still reach DONE, persist a valid,
   // empty report, and clear alarms — not hang in "scanning" with no report and
-  // no scheduled alarm (MILESTONE-1-AUDIT.md Finding 2).
+   // no scheduled alarm.
   console.log('\n[Part 7] empty bookmark tree reaches DONE with a valid empty report.');
   const EMPTY_MOCK = new MockChrome([]);
   const emptyController = createScanController(EMPTY_MOCK.deps({ getNow: () => NOW, loadRules: () => Promise.resolve(rules) }));
@@ -600,13 +600,13 @@ async function main() {
   check('resume over an empty done scan schedules no alarm', EMPTY_MOCK.pendingAlarms === 0,
     'alarms=' + EMPTY_MOCK.pendingAlarms);
 
-  // ---- Part 8: Milestone 2 detection persisted into the scan report -----------
+  // ---- Part 8: detection persisted into the scan report ----------------------
   // The report must carry exact, deterministic duplicate groups (from records,
   // excluding soft-deleted) and the tree-derived empty-folder / same-name merge
   // findings — while the M1 open-history metrics stay truthful. The duplicate
   // group count must equal the independently derived value, and the folder list
   // must equal an independent analysis of the same tree.
-  console.log('\n[Part 8] Milestone 2 detection is persisted into the Library Report.');
+  console.log('\n[Part 8] Detection is persisted into the Library Report.');
   // Use the full clean run (Part 1) report, whose scan persisted folder
   // findings and whose records match the whole tree, so the independent folder
   // analysis uses the same source of truth.
@@ -700,7 +700,7 @@ async function main() {
   check('no empty synthetic-root segment leaks into a user folder path',
     userFolderFindings.emptyFolders.every((f) => f.path[0] !== ''), '');
 
-  // ---- Part 9: Milestone 2 link-check controller (permission gate + execution) -
+  // ---- Part 9: link-check controller (permission gate + execution) -----------
   // The controller must refuse to run without the optional host permission,
   // must never fetch automatically, and must classify three states exactly.
   console.log('\n[Part 9] link-check controller: permission gate + three-state execution.');
@@ -1011,7 +1011,7 @@ async function main() {
     '');
 
   // ---- Part 11: rapid/repeated "Scan now" requests must not loop -------------
-  // Milestone 1/2 stabilization. The popup disables Scan now while a scan is in
+  // Scan stabilization. The popup disables Scan now while a scan is in
   // the SCANNING phase; as defense-in-depth the controller's requestScan is a
   // serialized driver that refuses to START a new scan while storage still holds
   // a SCANNING checkpoint (a real scan spans many worker awake in storage:
@@ -1074,7 +1074,111 @@ async function main() {
   check('fresh scan reaches DONE with a clean total', freshCp2 && freshCp2.phase === constants.PHASE.DONE &&
     freshCp2.totalCount === midQueue.length, 'total=' + (freshCp2 && freshCp2.totalCount));
 
-  // ---- Part 12: Milestone 3 — safe cleanup / Salvage Trash -------------------
+  // ---- Part 11b: scan failure recovery (storageSet rejection) ----------------
+  // A one-time rejection on the first chunk persistence must: leave a terminal
+  // FAILED checkpoint with error detail, clear alarms, leave no uncaught resume
+  // error, and allow a later startNewScan to succeed cleanly.
+  console.log('\n[Part 11b] scan failure recovery: storageSet rejection -> terminal FAILED -> retry succeeds.');
+
+  const FAIL_MOCK = new MockChrome(tree);
+  let failWriteCount = 0;
+  const FAIL_DEPS = FAIL_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules),
+    storageSet: (obj) => {
+      failWriteCount++;
+      if (failWriteCount === 1) {
+        return Promise.reject(new Error('quota exceeded'));
+      }
+      return FAIL_MOCK.storage.local.set(obj);
+    }
+  });
+  const failController = createScanController(FAIL_DEPS);
+  await failController.startNewScan();
+  const failSnap = FAIL_MOCK.snapshot();
+  const failCp = failSnap[constants.KEYS.CHECKPOINT];
+  check('failed scan reaches terminal FAILED phase', failCp && failCp.phase === constants.PHASE.FAILED,
+    'phase=' + (failCp && failCp.phase));
+  check('failed checkpoint carries error detail', failCp && typeof failCp.error === 'string' && failCp.error.indexOf('quota') !== -1,
+    'error=' + (failCp && failCp.error));
+  check('failed checkpoint preserves processedCount (0, first chunk failed)',
+    failCp && failCp.processedCount === 0, 'processed=' + (failCp && failCp.processedCount));
+  check('failed checkpoint preserves totalCount', failCp && failCp.totalCount === queue.length,
+    'total=' + (failCp && failCp.totalCount));
+  check('failed scan clears alarms (no scheduled wake)', FAIL_MOCK.pendingAlarms === 0,
+    'alarms=' + FAIL_MOCK.pendingAlarms);
+  // Queue and records are cleared in the best-effort second write.
+  check('failed scan clears stored queue (best-effort compact)',
+    (failSnap[constants.KEYS.QUEUE] || []).length === 0,
+    'queue=' + (failSnap[constants.KEYS.QUEUE] || []).length);
+  check('failed scan clears stored records (best-effort compact)',
+    (failSnap[constants.KEYS.RECORDS] || []).length === 0,
+    'records=' + (failSnap[constants.KEYS.RECORDS] || []).length);
+
+  // Resume over a FAILED checkpoint must be a no-op (no error, no alarm).
+  const failResumeCtrl = createScanController(FAIL_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  await failResumeCtrl.resume();
+  const failResumeSnap = FAIL_MOCK.snapshot();
+  check('resume over FAILED is a no-op (phase stays FAILED)',
+    failResumeSnap[constants.KEYS.CHECKPOINT].phase === constants.PHASE.FAILED,
+    'phase=' + failResumeSnap[constants.KEYS.CHECKPOINT].phase);
+  check('resume over FAILED schedules no alarm', FAIL_MOCK.pendingAlarms === 0,
+    'alarms=' + FAIL_MOCK.pendingAlarms);
+
+  // A later startNewScan starts cleanly from FAILED state.
+  const retryController = createScanController(FAIL_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  await retryController.startNewScan();
+  const retrySnap = FAIL_MOCK.snapshot();
+  const retryCp = retrySnap[constants.KEYS.CHECKPOINT];
+  check('retry startNewScan from FAILED reaches DONE', retryCp && retryCp.phase === constants.PHASE.DONE,
+    'phase=' + (retryCp && retryCp.phase));
+  check('retry produces a full report', !!retrySnap[constants.KEYS.REPORT], '');
+  check('retry has complete records', (retrySnap[constants.KEYS.RECORDS] || []).length === queue.length,
+    'records=' + (retrySnap[constants.KEYS.RECORDS] || []).length);
+
+  // ---- Part 11c: scan failure recovery mid-scan (second chunk fails) ---------
+  // The first chunk succeeds, the second fails. The checkpoint must show the
+  // cursor at the first chunk boundary (processedCount = CHUNK_SIZE).
+  console.log('\n[Part 11c] scan failure mid-scan: second chunk fails -> FAILED at first chunk boundary.');
+
+  const FAIL2_MOCK = new MockChrome(tree);
+  let fail2WriteCount = 0;
+  const FAIL2_DEPS = FAIL2_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules),
+    storageSet: (obj) => {
+      fail2WriteCount++;
+      // First write is startNewScan's reset (succeeds). Second write is the
+      // first chunk persistence (succeeds). Third write is the second chunk
+      // (fails).
+      if (fail2WriteCount === 3) {
+        return Promise.reject(new Error('storage write failed'));
+      }
+      return FAIL2_MOCK.storage.local.set(obj);
+    }
+  });
+  const fail2Controller = createScanController(FAIL2_DEPS);
+  await fail2Controller.startNewScan();
+  const fail2Snap = FAIL2_MOCK.snapshot();
+  const fail2Cp = fail2Snap[constants.KEYS.CHECKPOINT];
+  check('mid-scan failure reaches FAILED', fail2Cp && fail2Cp.phase === constants.PHASE.FAILED,
+    'phase=' + (fail2Cp && fail2Cp.phase));
+  check('mid-scan failure processedCount at first chunk boundary',
+    fail2Cp && fail2Cp.processedCount === constants.CHUNK_SIZE,
+    'processed=' + (fail2Cp && fail2Cp.processedCount));
+  check('mid-scan failure carries error detail',
+    fail2Cp && typeof fail2Cp.error === 'string' && fail2Cp.error.indexOf('storage write failed') !== -1,
+    'error=' + (fail2Cp && fail2Cp.error));
+  check('mid-scan failure clears alarms', FAIL2_MOCK.pendingAlarms === 0,
+    'alarms=' + FAIL2_MOCK.pendingAlarms);
+
+  // ---- Part 12: safe cleanup / Salvage Trash ---------------------------------
   // An in-memory mock chrome.bookmarks with real move/create/remove semantics
   // (not just getTree) so the trash controller's safe-move path is exercised
   // against the exact source it runs in the extension. "Worker restart" is
@@ -1762,6 +1866,770 @@ async function main() {
   const rebuiltRecords = tStore[constants.KEYS.RECORDS] || [];
   const rebuiltDead = rebuiltRecords.filter((r) => r.linkStatus === constants.LINK_STATUS_UNREACHABLE).length;
   check('[rescan] rebuilt records carry no stale unreachable status (popup shows 0)', rebuiltDead === 0, 'dead=' + rebuiltDead);
+
+  // ---- Part 15: SCANNING checkpoint at processed==total, no alarm; resume ----
+  // Regression for the P0 wedge: if the last chunk persisted SCANNING with
+  // processedCount===totalCount but the worker died or finishScan's storage
+  // write rejected before the DONE checkpoint, resume must still reach DONE
+  // with a report. Without the fix, resumeImpl's `processedCount < totalCount`
+  // guard returned null and the scan was permanently wedged.
+  console.log('\n[Part 15] SCANNING checkpoint at processed==total, no alarm; resume reaches DONE.');
+
+  const WEDGE_MOCK = new MockChrome(tree);
+  const wedgeQueue = fullController.flattenTree(tree, []);
+  const wedgeRecords = fullController.upsertRecords([], wedgeQueue.map((item) =>
+    fullController.itemToRecord(item, rules, NOW)), NOW);
+  await WEDGE_MOCK.storage.local.set({
+    [constants.KEYS.QUEUE]: wedgeQueue,
+    [constants.KEYS.RECORDS]: wedgeRecords,
+    [constants.KEYS.CHECKPOINT]: {
+      phase: constants.PHASE.SCANNING,
+      totalCount: wedgeQueue.length,
+      processedCount: wedgeQueue.length,
+      lastProcessedId: String(wedgeQueue[wedgeQueue.length - 1].id),
+      updatedAt: NOW,
+      scanStartedAt: NOW
+    },
+    [constants.KEYS.SCHEMA]: constants.SCHEMA_VERSION
+  });
+  // No alarm armed — the worker died after the last chunk write.
+  check('wedge precondition: no alarm armed', WEDGE_MOCK.pendingAlarms === 0,
+    'alarms=' + WEDGE_MOCK.pendingAlarms);
+
+  const wedgeController = createScanController(WEDGE_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  await wedgeController.resume();
+
+  const wedgeSnap = WEDGE_MOCK.snapshot();
+  const wedgeCp = wedgeSnap[constants.KEYS.CHECKPOINT];
+  check('wedge resume reaches DONE (not stuck at SCANNING)',
+    wedgeCp && wedgeCp.phase === constants.PHASE.DONE,
+    'phase=' + (wedgeCp && wedgeCp.phase));
+  check('wedge resume processedCount == totalCount',
+    wedgeCp && wedgeCp.processedCount === wedgeCp.totalCount,
+    wedgeCp && (wedgeCp.processedCount + '/' + wedgeCp.totalCount));
+  check('wedge resume generates a report',
+    !!wedgeSnap[constants.KEYS.REPORT], '');
+  check('wedge resume report total == queue length',
+    wedgeSnap[constants.KEYS.REPORT] &&
+    wedgeSnap[constants.KEYS.REPORT][constants.METRIC.TOTAL] === wedgeQueue.length,
+    'total=' + (wedgeSnap[constants.KEYS.REPORT] && wedgeSnap[constants.KEYS.REPORT][constants.METRIC.TOTAL]));
+  check('wedge resume clears alarms', WEDGE_MOCK.pendingAlarms === 0,
+    'alarms=' + WEDGE_MOCK.pendingAlarms);
+  // Idempotent: replaying resume over DONE is a no-op.
+  await wedgeController.resume();
+  const wedgeSnap2 = WEDGE_MOCK.snapshot();
+  check('wedge second resume stays DONE (idempotent)',
+    wedgeSnap2[constants.KEYS.CHECKPOINT].phase === constants.PHASE.DONE,
+    'phase=' + wedgeSnap2[constants.KEYS.CHECKPOINT].phase);
+
+  // ---- Part 16: final DONE write rejection -> FAILED/no alarm/retry ----------
+  // If finishScan's storageSet rejects (e.g. quota), the controller must persist
+  // a terminal FAILED checkpoint with error detail, clear alarms, and expose
+  // retry. A subsequent startNewScan must complete normally.
+  console.log('\n[Part 16] final DONE write rejection -> FAILED/no alarm/retry; new scan completes.');
+
+  const REJECT_MOCK = new MockChrome(tree);
+  let rejectWriteCount = 0;
+  let rejectDoneSeen = false;
+  const REJECT_DEPS = REJECT_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules),
+    storageSet: (obj) => {
+      rejectWriteCount++;
+      const cp = obj[constants.KEYS.CHECKPOINT];
+      // Reject the first DONE checkpoint write (finishScan's final persistence).
+      if (!rejectDoneSeen && cp && cp.phase === constants.PHASE.DONE) {
+        rejectDoneSeen = true;
+        return Promise.reject(new Error('quota exceeded on final write'));
+      }
+      return REJECT_MOCK.storage.local.set(obj);
+    }
+  });
+  const rejectController = createScanController(REJECT_DEPS);
+  await rejectController.startNewScan();
+
+  const rejectSnap = REJECT_MOCK.snapshot();
+  const rejectCp = rejectSnap[constants.KEYS.CHECKPOINT];
+  check('rejected DONE write -> terminal FAILED checkpoint',
+    rejectCp && rejectCp.phase === constants.PHASE.FAILED,
+    'phase=' + (rejectCp && rejectCp.phase));
+  check('FAILED checkpoint carries error detail',
+    rejectCp && typeof rejectCp.error === 'string' &&
+    rejectCp.error.indexOf('quota exceeded') !== -1,
+    'error=' + (rejectCp && rejectCp.error));
+  check('FAILED checkpoint processedCount == totalCount (all work done)',
+    rejectCp && rejectCp.processedCount === rejectCp.totalCount,
+    rejectCp && (rejectCp.processedCount + '/' + rejectCp.totalCount));
+  check('FAILED checkpoint clears alarms (no scheduled wake)',
+    REJECT_MOCK.pendingAlarms === 0,
+    'alarms=' + REJECT_MOCK.pendingAlarms);
+  check('FAILED checkpoint has no report (DONE write was rejected)',
+    !rejectSnap[constants.KEYS.REPORT], '');
+
+  // Resume over FAILED is a no-op (no error, no alarm).
+  const rejectResumeCtrl = createScanController(REJECT_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  await rejectResumeCtrl.resume();
+  const rejectResumeSnap = REJECT_MOCK.snapshot();
+  check('resume over FAILED is a no-op (phase stays FAILED)',
+    rejectResumeSnap[constants.KEYS.CHECKPOINT].phase === constants.PHASE.FAILED,
+    'phase=' + rejectResumeSnap[constants.KEYS.CHECKPOINT].phase);
+  check('resume over FAILED schedules no alarm',
+    REJECT_MOCK.pendingAlarms === 0,
+    'alarms=' + REJECT_MOCK.pendingAlarms);
+
+  // Retry: a new startNewScan must complete normally after the failure.
+  const retryRejectCtrl = createScanController(REJECT_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  await retryRejectCtrl.startNewScan();
+  const retryRejectSnap = REJECT_MOCK.snapshot();
+  const retryRejectCp = retryRejectSnap[constants.KEYS.CHECKPOINT];
+  check('retry after FAILED reaches DONE',
+    retryRejectCp && retryRejectCp.phase === constants.PHASE.DONE,
+    'phase=' + (retryRejectCp && retryRejectCp.phase));
+  check('retry produces a full report',
+    !!retryRejectSnap[constants.KEYS.REPORT], '');
+  check('retry report total == queue length',
+    retryRejectSnap[constants.KEYS.REPORT] &&
+    retryRejectSnap[constants.KEYS.REPORT][constants.METRIC.TOTAL] === queue.length,
+    'total=' + (retryRejectSnap[constants.KEYS.REPORT] && retryRejectSnap[constants.KEYS.REPORT][constants.METRIC.TOTAL]));
+  check('retry has complete records',
+    (retryRejectSnap[constants.KEYS.RECORDS] || []).length === queue.length,
+    'records=' + (retryRejectSnap[constants.KEYS.RECORDS] || []).length);
+
+  // ---- Part 17: pre-write finalization failures -> FAILED/no alarm/retry ----
+  // If finishScan's storageGet, loadTrashDeletedIds, or computeReport rejects
+  // BEFORE the final storageSet, the controller must still persist a terminal
+  // FAILED checkpoint with error detail, clear alarms, and expose retry. Without
+  // the fix, these pre-write failures propagate uncaught, leaving the checkpoint
+  // at SCANNING with processed==total and no alarm — a permanent wedge.
+  console.log('\n[Part 17] pre-write finalization failures -> FAILED/no alarm/retry.');
+
+  // 17a. storageGet rejects when finishScan reads RECORDS + FOLDER_FINDINGS.
+  // The scan processes all chunks normally, then the finalization read fails.
+  console.log('  [17a] storageGet rejection during finishScan.');
+  const FIN_GET_MOCK = new MockChrome(tree);
+  let finGetCallCount = 0;
+  const FIN_GET_DEPS = FIN_GET_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules),
+    storageGet: (keys) => {
+      finGetCallCount++;
+      // Reject only when finishScan reads RECORDS + FOLDER_FINDINGS (the only
+      // call that requests FOLDER_FINDINGS). All other reads pass through.
+      if (Array.isArray(keys) && keys.indexOf(constants.KEYS.FOLDER_FINDINGS) !== -1) {
+        return Promise.reject(new Error('storage read failed'));
+      }
+      return FIN_GET_MOCK.storage.local.get(keys);
+    }
+  });
+  const finGetController = createScanController(FIN_GET_DEPS);
+  await finGetController.startNewScan();
+  const finGetSnap = FIN_GET_MOCK.snapshot();
+  const finGetCp = finGetSnap[constants.KEYS.CHECKPOINT];
+  check('[17a] storageGet failure during finalization reaches FAILED',
+    finGetCp && finGetCp.phase === constants.PHASE.FAILED,
+    'phase=' + (finGetCp && finGetCp.phase));
+  check('[17a] storageGet failure carries actionable error detail',
+    finGetCp && typeof finGetCp.error === 'string' && finGetCp.error.indexOf('storage read failed') !== -1,
+    'error=' + (finGetCp && finGetCp.error));
+  check('[17a] storageGet failure processedCount == totalCount (all chunks done)',
+    finGetCp && finGetCp.processedCount === finGetCp.totalCount,
+    finGetCp && (finGetCp.processedCount + '/' + finGetCp.totalCount));
+  check('[17a] storageGet failure clears alarms (no scheduled wake)',
+    FIN_GET_MOCK.pendingAlarms === 0,
+    'alarms=' + FIN_GET_MOCK.pendingAlarms);
+  // Resume over FAILED is a no-op.
+  const finGetResumeCtrl = createScanController(FIN_GET_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  await finGetResumeCtrl.resume();
+  check('[17a] resume over FAILED is a no-op (phase stays FAILED)',
+    FIN_GET_MOCK.snapshot()[constants.KEYS.CHECKPOINT].phase === constants.PHASE.FAILED, '');
+  // Retry: a new startNewScan must complete normally.
+  const finGetRetry = createScanController(FIN_GET_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  await finGetRetry.startNewScan();
+  const finGetRetrySnap = FIN_GET_MOCK.snapshot();
+  const finGetRetryCp = finGetRetrySnap[constants.KEYS.CHECKPOINT];
+  check('[17a] retry after storageGet failure reaches DONE',
+    finGetRetryCp && finGetRetryCp.phase === constants.PHASE.DONE,
+    'phase=' + (finGetRetryCp && finGetRetryCp.phase));
+  check('[17a] retry produces complete records',
+    (finGetRetrySnap[constants.KEYS.RECORDS] || []).length === queue.length,
+    'records=' + (finGetRetrySnap[constants.KEYS.RECORDS] || []).length);
+  check('[17a] retry produces a report',
+    !!finGetRetrySnap[constants.KEYS.REPORT], '');
+
+  // 17b. loadTrashDeletedIds rejects during finishScan.
+  console.log('  [17b] loadTrashDeletedIds rejection during finishScan.');
+  const FIN_TRASH_MOCK = new MockChrome(tree);
+  const FIN_TRASH_DEPS = FIN_TRASH_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules),
+    loadTrashDeletedIds: () => Promise.reject(new Error('trash load failed'))
+  });
+  const finTrashController = createScanController(FIN_TRASH_DEPS);
+  await finTrashController.startNewScan();
+  const finTrashSnap = FIN_TRASH_MOCK.snapshot();
+  const finTrashCp = finTrashSnap[constants.KEYS.CHECKPOINT];
+  check('[17b] loadTrashDeletedIds failure reaches FAILED',
+    finTrashCp && finTrashCp.phase === constants.PHASE.FAILED,
+    'phase=' + (finTrashCp && finTrashCp.phase));
+  check('[17b] loadTrashDeletedIds failure carries actionable error detail',
+    finTrashCp && typeof finTrashCp.error === 'string' && finTrashCp.error.indexOf('trash load failed') !== -1,
+    'error=' + (finTrashCp && finTrashCp.error));
+  check('[17b] loadTrashDeletedIds failure processedCount == totalCount',
+    finTrashCp && finTrashCp.processedCount === finTrashCp.totalCount,
+    finTrashCp && (finTrashCp.processedCount + '/' + finTrashCp.totalCount));
+  check('[17b] loadTrashDeletedIds failure clears alarms',
+    FIN_TRASH_MOCK.pendingAlarms === 0,
+    'alarms=' + FIN_TRASH_MOCK.pendingAlarms);
+  // Resume over FAILED is a no-op.
+  const finTrashResumeCtrl = createScanController(FIN_TRASH_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  await finTrashResumeCtrl.resume();
+  check('[17b] resume over FAILED is a no-op (phase stays FAILED)',
+    FIN_TRASH_MOCK.snapshot()[constants.KEYS.CHECKPOINT].phase === constants.PHASE.FAILED, '');
+  // Retry: a new startNewScan must complete normally.
+  const finTrashRetry = createScanController(FIN_TRASH_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  await finTrashRetry.startNewScan();
+  const finTrashRetrySnap = FIN_TRASH_MOCK.snapshot();
+  const finTrashRetryCp = finTrashRetrySnap[constants.KEYS.CHECKPOINT];
+  check('[17b] retry after loadTrashDeletedIds failure reaches DONE',
+    finTrashRetryCp && finTrashRetryCp.phase === constants.PHASE.DONE,
+    'phase=' + (finTrashRetryCp && finTrashRetryCp.phase));
+  check('[17b] retry produces complete records',
+    (finTrashRetrySnap[constants.KEYS.RECORDS] || []).length === queue.length,
+    'records=' + (finTrashRetrySnap[constants.KEYS.RECORDS] || []).length);
+  check('[17b] retry produces a report',
+    !!finTrashRetrySnap[constants.KEYS.REPORT], '');
+
+  // 17c. computeReport throws during finishScan.
+  // Monkey-patch report.computeReport to throw on the first call, then restore.
+  console.log('  [17c] computeReport throw during finishScan.');
+  const FIN_RPT_MOCK = new MockChrome(tree);
+  const origComputeReport = report.computeReport;
+  let computeReportCallCount = 0;
+  report.computeReport = function () {
+    computeReportCallCount++;
+    if (computeReportCallCount === 1) {
+      throw new Error('report computation failed');
+    }
+    return origComputeReport.apply(this, arguments);
+  };
+  const finRptController = createScanController(FIN_RPT_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  await finRptController.startNewScan();
+  report.computeReport = origComputeReport;
+  const finRptSnap = FIN_RPT_MOCK.snapshot();
+  const finRptCp = finRptSnap[constants.KEYS.CHECKPOINT];
+  check('[17c] computeReport failure reaches FAILED',
+    finRptCp && finRptCp.phase === constants.PHASE.FAILED,
+    'phase=' + (finRptCp && finRptCp.phase));
+  check('[17c] computeReport failure carries actionable error detail',
+    finRptCp && typeof finRptCp.error === 'string' && finRptCp.error.indexOf('report computation failed') !== -1,
+    'error=' + (finRptCp && finRptCp.error));
+  check('[17c] computeReport failure processedCount == totalCount',
+    finRptCp && finRptCp.processedCount === finRptCp.totalCount,
+    finRptCp && (finRptCp.processedCount + '/' + finRptCp.totalCount));
+  check('[17c] computeReport failure clears alarms',
+    FIN_RPT_MOCK.pendingAlarms === 0,
+    'alarms=' + FIN_RPT_MOCK.pendingAlarms);
+  // Resume over FAILED is a no-op.
+  const finRptResumeCtrl = createScanController(FIN_RPT_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  await finRptResumeCtrl.resume();
+  check('[17c] resume over FAILED is a no-op (phase stays FAILED)',
+    FIN_RPT_MOCK.snapshot()[constants.KEYS.CHECKPOINT].phase === constants.PHASE.FAILED, '');
+  // Retry: a new startNewScan must complete normally (computeReport is restored).
+  const finRptRetry = createScanController(FIN_RPT_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  await finRptRetry.startNewScan();
+  const finRptRetrySnap = FIN_RPT_MOCK.snapshot();
+  const finRptRetryCp = finRptRetrySnap[constants.KEYS.CHECKPOINT];
+  check('[17c] retry after computeReport failure reaches DONE',
+    finRptRetryCp && finRptRetryCp.phase === constants.PHASE.DONE,
+    'phase=' + (finRptRetryCp && finRptRetryCp.phase));
+  check('[17c] retry produces complete records',
+    (finRptRetrySnap[constants.KEYS.RECORDS] || []).length === queue.length,
+    'records=' + (finRptRetrySnap[constants.KEYS.RECORDS] || []).length);
+  check('[17c] retry produces a report',
+    !!finRptRetrySnap[constants.KEYS.REPORT], '');
+
+  // ---- Part 18: primary FAILED + compact fallback reject, minimal fallback succeeds
+  // The startNewScan catch handler must properly await each fallback write so a
+  // rejected compact write (checkpoint + empty queue/records) triggers the
+  // minimal write (checkpoint only). Previously the synchronous try/catch around
+  // promise-returning storageSet meant a rejected compact write was never caught
+  // and the minimal fallback was never attempted.
+  console.log('\n[Part 18] primary FAILED + compact fallback reject, minimal fallback succeeds.');
+
+  const P18_MOCK = new MockChrome(tree);
+  let p18WriteCount = 0;
+  const P18_DEPS = P18_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules),
+    storageSet: (obj) => {
+      p18WriteCount++;
+      if (p18WriteCount <= 2) {
+        // First write (initial scan payload) and second write (compact
+        // fallback: checkpoint + empty queue/records) both reject.
+        return Promise.reject(new Error('quota exceeded'));
+      }
+      // Third write (minimal fallback: checkpoint + schema only) succeeds.
+      return P18_MOCK.storage.local.set(obj);
+    }
+  });
+  const p18Controller = createScanController(P18_DEPS);
+  await p18Controller.startNewScan();
+  const p18Snap = P18_MOCK.snapshot();
+  const p18Cp = p18Snap[constants.KEYS.CHECKPOINT];
+  check('[18] persisted FAILED after compact fallback rejects',
+    p18Cp && p18Cp.phase === constants.PHASE.FAILED,
+    'phase=' + (p18Cp && p18Cp.phase));
+  check('[18] error detail from primary failure',
+    p18Cp && typeof p18Cp.error === 'string' && p18Cp.error.indexOf('quota') !== -1,
+    'error=' + (p18Cp && p18Cp.error));
+  check('[18] no alarm after FAILED',
+    P18_MOCK.pendingAlarms === 0,
+    'alarms=' + P18_MOCK.pendingAlarms);
+  check('[18] three storageSet calls attempted (primary + compact + minimal)',
+    p18WriteCount === 3,
+    'writes=' + p18WriteCount);
+  // The minimal fallback wrote only checkpoint + schema (no queue/records keys).
+  check('[18] minimal fallback did not write queue or records keys',
+    !('queue' in p18Snap) && !('records' in p18Snap),
+    'queue=' + ('queue' in p18Snap) + ' records=' + ('records' in p18Snap));
+
+  // Retry from FAILED: a new startNewScan must complete normally.
+  const p18Retry = createScanController(P18_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  await p18Retry.startNewScan();
+  const p18RetrySnap = P18_MOCK.snapshot();
+  const p18RetryCp = p18RetrySnap[constants.KEYS.CHECKPOINT];
+  check('[18] retry from FAILED reaches DONE',
+    p18RetryCp && p18RetryCp.phase === constants.PHASE.DONE,
+    'phase=' + (p18RetryCp && p18RetryCp.phase));
+  check('[18] retry produces a report',
+    !!p18RetrySnap[constants.KEYS.REPORT], '');
+  check('[18] retry has complete records',
+    (p18RetrySnap[constants.KEYS.RECORDS] || []).length === queue.length,
+    'records=' + (p18RetrySnap[constants.KEYS.RECORDS] || []).length);
+
+  // ---- Part 19: checkpoint/queue read rejection during active resume ---------
+  // Any storage read rejection during resume (readCheckpoint or storageGet for
+  // queue/records) must funnel into a terminal FAILED transition, clear the
+  // alarm, and allow retry. Previously these rejections propagated unhandled,
+  // leaving the checkpoint at SCANNING with no alarm — a permanent wedge.
+  console.log('\n[Part 19] checkpoint/queue read rejection during active resume -> FAILED/no alarm/retry.');
+
+  // 19a: readCheckpoint rejects during resume.
+  const P19A_MOCK = new MockChrome(tree);
+  const p19aQueue = fullController.flattenTree(tree, []);
+  await P19A_MOCK.storage.local.set({
+    [constants.KEYS.QUEUE]: p19aQueue,
+    [constants.KEYS.RECORDS]: [],
+    [constants.KEYS.CHECKPOINT]: {
+      phase: constants.PHASE.SCANNING,
+      totalCount: p19aQueue.length,
+      processedCount: 0,
+      lastProcessedId: null,
+      updatedAt: NOW,
+      scanStartedAt: NOW
+    },
+    [constants.KEYS.SCHEMA]: constants.SCHEMA_VERSION
+  });
+  let p19aGetCount = 0;
+  const P19A_DEPS = P19A_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules),
+    storageGet: (keys) => {
+      p19aGetCount++;
+      if (p19aGetCount === 1) {
+        // First read (readCheckpoint) rejects.
+        return Promise.reject(new Error('storage read failed'));
+      }
+      return P19A_MOCK.storage.local.get(keys);
+    }
+  });
+  const p19aController = createScanController(P19A_DEPS);
+  await p19aController.resume();
+  const p19aSnap = P19A_MOCK.snapshot();
+  const p19aCp = p19aSnap[constants.KEYS.CHECKPOINT];
+  check('[19a] readCheckpoint rejection during resume -> FAILED',
+    p19aCp && p19aCp.phase === constants.PHASE.FAILED,
+    'phase=' + (p19aCp && p19aCp.phase));
+  check('[19a] error detail from read failure',
+    p19aCp && typeof p19aCp.error === 'string' && p19aCp.error.indexOf('storage read failed') !== -1,
+    'error=' + (p19aCp && p19aCp.error));
+  check('[19a] no alarm after FAILED',
+    P19A_MOCK.pendingAlarms === 0,
+    'alarms=' + P19A_MOCK.pendingAlarms);
+  check('[19a] minimal FAILED checkpoint uses safe defaults (totalCount=0)',
+    p19aCp && p19aCp.totalCount === 0 && p19aCp.processedCount === 0,
+    'total=' + (p19aCp && p19aCp.totalCount) + ' processed=' + (p19aCp && p19aCp.processedCount));
+
+  // Retry from FAILED: a new startNewScan must complete normally.
+  const p19aRetry = createScanController(P19A_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  await p19aRetry.startNewScan();
+  const p19aRetrySnap = P19A_MOCK.snapshot();
+  check('[19a] retry from FAILED reaches DONE',
+    p19aRetrySnap[constants.KEYS.CHECKPOINT].phase === constants.PHASE.DONE,
+    'phase=' + p19aRetrySnap[constants.KEYS.CHECKPOINT].phase);
+  check('[19a] retry produces complete records',
+    (p19aRetrySnap[constants.KEYS.RECORDS] || []).length === queue.length,
+    'records=' + (p19aRetrySnap[constants.KEYS.RECORDS] || []).length);
+
+  // 19b: storageGet (queue/records) rejects during processActiveWindow.
+  const P19B_MOCK = new MockChrome(tree);
+  const p19bQueue = fullController.flattenTree(tree, []);
+  await P19B_MOCK.storage.local.set({
+    [constants.KEYS.QUEUE]: p19bQueue,
+    [constants.KEYS.RECORDS]: [],
+    [constants.KEYS.CHECKPOINT]: {
+      phase: constants.PHASE.SCANNING,
+      totalCount: p19bQueue.length,
+      processedCount: 0,
+      lastProcessedId: null,
+      updatedAt: NOW,
+      scanStartedAt: NOW
+    },
+    [constants.KEYS.SCHEMA]: constants.SCHEMA_VERSION
+  });
+  let p19bGetCount = 0;
+  const P19B_DEPS = P19B_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules),
+    storageGet: (keys) => {
+      p19bGetCount++;
+      // resumeImpl reads checkpoint (call 1), processActiveWindowImpl reads
+      // checkpoint again (call 2), then reads queue/records (call 3).
+      // Calls 1-2 succeed; call 3 rejects.
+      if (p19bGetCount === 3) {
+        return Promise.reject(new Error('queue read failed'));
+      }
+      return P19B_MOCK.storage.local.get(keys);
+    }
+  });
+  const p19bController = createScanController(P19B_DEPS);
+  await p19bController.resume();
+  const p19bSnap = P19B_MOCK.snapshot();
+  const p19bCp = p19bSnap[constants.KEYS.CHECKPOINT];
+  check('[19b] queue/records read rejection during resume -> FAILED',
+    p19bCp && p19bCp.phase === constants.PHASE.FAILED,
+    'phase=' + (p19bCp && p19bCp.phase));
+  check('[19b] error detail from queue read failure',
+    p19bCp && typeof p19bCp.error === 'string' && p19bCp.error.indexOf('queue read failed') !== -1,
+    'error=' + (p19bCp && p19bCp.error));
+  check('[19b] no alarm after FAILED',
+    P19B_MOCK.pendingAlarms === 0,
+    'alarms=' + P19B_MOCK.pendingAlarms);
+  check('[19b] totalCount preserved from checkpoint',
+    p19bCp && p19bCp.totalCount === p19bQueue.length,
+    'total=' + (p19bCp && p19bCp.totalCount));
+
+  // Retry from FAILED: a new startNewScan must complete normally.
+  const p19bRetry = createScanController(P19B_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  await p19bRetry.startNewScan();
+  const p19bRetrySnap = P19B_MOCK.snapshot();
+  check('[19b] retry from FAILED reaches DONE',
+    p19bRetrySnap[constants.KEYS.CHECKPOINT].phase === constants.PHASE.DONE,
+    'phase=' + p19bRetrySnap[constants.KEYS.CHECKPOINT].phase);
+  check('[19b] retry produces complete records',
+    (p19bRetrySnap[constants.KEYS.RECORDS] || []).length === queue.length,
+    'records=' + (p19bRetrySnap[constants.KEYS.RECORDS] || []).length);
+  check('[19b] retry produces a report',
+    !!p19bRetrySnap[constants.KEYS.REPORT], '');
+
+  // ---- Part 20: no-op schema-stamp write rejection must not downgrade DONE ---
+  // When processActiveWindowImpl encounters a DONE/IDLE checkpoint, it writes
+  // the checkpoint back as a no-op schema-stamp. If that write rejects (e.g.
+  // transient storage error), the rejection must be silently caught — it must
+  // NOT propagate into the caller's error handling or turn a completed DONE
+  // checkpoint into FAILED. This is a deterministic test of the fix.
+  console.log('\nPart 20: no-op schema-stamp write rejection must not downgrade DONE.');
+
+  const P20_MOCK = new MockChrome(tree);
+  // Seed a completed scan (DONE checkpoint + full records + report).
+  const p20Queue = fullController.flattenTree(tree, []);
+  const p20Records = fullController.upsertRecords([], p20Queue.map((item) =>
+    fullController.itemToRecord(item, rules, NOW)), NOW);
+  const p20Report = report.computeReport(p20Records, NOW, { folderFindings: null, timing: null });
+  await P20_MOCK.storage.local.set({
+    [constants.KEYS.QUEUE]: p20Queue,
+    [constants.KEYS.RECORDS]: p20Records,
+    [constants.KEYS.REPORT]: p20Report,
+    [constants.KEYS.CHECKPOINT]: {
+      phase: constants.PHASE.DONE,
+      totalCount: p20Queue.length,
+      processedCount: p20Queue.length,
+      lastProcessedId: String(p20Queue[p20Queue.length - 1].id),
+      updatedAt: NOW,
+      scanStartedAt: NOW,
+      scanCompletedAt: NOW,
+      durationMs: 100
+    },
+    [constants.KEYS.SCHEMA]: constants.SCHEMA_VERSION
+  });
+  let p20WriteCount = 0;
+  const P20_DEPS = P20_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules),
+    storageSet: (obj) => {
+      p20WriteCount++;
+      // The no-op schema-stamp write is the first write after resume reads
+      // the DONE checkpoint. Reject it to prove the error is swallowed.
+      if (p20WriteCount === 1) {
+        return Promise.reject(new Error('transient storage error'));
+      }
+      return P20_MOCK.storage.local.set(obj);
+    }
+  });
+  const p20Controller = createScanController(P20_DEPS);
+  // processActiveWindow reads the DONE checkpoint and hits the no-op schema-stamp
+  // path. The rejection must be caught, not propagated. We call processActiveWindow
+  // directly (not resume) because resume returns null early for non-SCANNING phases
+  // without reaching the schema-stamp write.
+  await p20Controller.processActiveWindow(rules);
+  const p20Snap = P20_MOCK.snapshot();
+  const p20Cp = p20Snap[constants.KEYS.CHECKPOINT];
+  check('[20] schema-stamp write rejection does NOT downgrade DONE to FAILED',
+    p20Cp && p20Cp.phase === constants.PHASE.DONE,
+    'phase=' + (p20Cp && p20Cp.phase));
+  check('[20] report is preserved (not wiped by error handling)',
+    !!p20Snap[constants.KEYS.REPORT], '');
+  check('[20] records are preserved',
+    (p20Snap[constants.KEYS.RECORDS] || []).length === p20Queue.length,
+    'records=' + (p20Snap[constants.KEYS.RECORDS] || []).length);
+  check('[20] no alarm scheduled (processActiveWindow over DONE is a no-op)',
+    P20_MOCK.pendingAlarms === 0,
+    'alarms=' + P20_MOCK.pendingAlarms);
+  // Exactly one write was attempted (the rejected schema-stamp); no further writes.
+  check('[20] exactly one storageSet attempted (the rejected schema-stamp)',
+    p20WriteCount === 1, 'writes=' + p20WriteCount);
+
+  // Same test for IDLE phase: schema-stamp rejection must not downgrade to FAILED.
+  console.log('  [20b] IDLE phase schema-stamp write rejection.');
+  const P20B_MOCK = new MockChrome(tree);
+  await P20B_MOCK.storage.local.set({
+    [constants.KEYS.CHECKPOINT]: {
+      phase: constants.PHASE.IDLE,
+      totalCount: 0,
+      processedCount: 0,
+      lastProcessedId: null,
+      updatedAt: 0,
+      scanStartedAt: null
+    },
+    [constants.KEYS.SCHEMA]: constants.SCHEMA_VERSION
+  });
+  let p20bWriteCount = 0;
+  const P20B_DEPS = P20B_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules),
+    storageSet: (obj) => {
+      p20bWriteCount++;
+      if (p20bWriteCount === 1) {
+        return Promise.reject(new Error('transient storage error'));
+      }
+      return P20B_MOCK.storage.local.set(obj);
+    }
+  });
+  const p20bController = createScanController(P20B_DEPS);
+  await p20bController.processActiveWindow(rules);
+  const p20bSnap = P20B_MOCK.snapshot();
+  const p20bCp = p20bSnap[constants.KEYS.CHECKPOINT];
+  check('[20b] IDLE schema-stamp rejection does NOT downgrade to FAILED',
+    p20bCp && p20bCp.phase === constants.PHASE.IDLE,
+    'phase=' + (p20bCp && p20bCp.phase));
+  check('[20b] no alarm scheduled',
+    P20B_MOCK.pendingAlarms === 0,
+    'alarms=' + P20B_MOCK.pendingAlarms);
+
+  // ---- Part 21: all storageSet writes reject -> explicit {failed:true} / no throw / no wake -
+  // P0 boundary: when EVERY attempted storageSet write in the failure path rejects
+  // (primary write + compact fallback + minimal fallback), the controller must:
+  //   1. Not throw (no uncaught rejection).
+  //   2. Call clearWake (no scheduled alarm).
+  //   3. Return {failed:true, phase:PHASE.FAILED, error} from startNewScan.
+  // The service-worker maps that to {ok:false, phase:PHASE.FAILED, error} so the
+  // popup can enable Scan now and show COPY.scanFailed without a storage event.
+  // After storage recovers a later scan must succeed cleanly.
+  console.log('\n[Part 21] all storageSet writes reject -> explicit {failed:true}; retry succeeds.');
+
+  // 21a: startNewScan — every storageSet call rejects.
+  const P21_MOCK = new MockChrome(tree);
+  let p21Writes = 0;
+  const P21_DEPS = P21_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules),
+    storageSet: () => { p21Writes++; return Promise.reject(new Error('total storage failure')); }
+  });
+  const p21Ctrl = createScanController(P21_DEPS);
+
+  let p21Result;
+  let p21Threw = false;
+  try {
+    p21Result = await p21Ctrl.startNewScan();
+  } catch (e) { p21Threw = true; }
+  check('[21] all-writes-reject startNewScan does NOT throw', p21Threw === false, 'threw=' + p21Threw);
+  check('[21] all-writes-reject returns {failed:true, phase:FAILED, error}',
+    p21Result && p21Result.failed === true && p21Result.phase === constants.PHASE.FAILED &&
+    typeof p21Result.error === 'string' && p21Result.error.length > 0,
+    JSON.stringify(p21Result));
+  check('[21] clearWake called (no alarm scheduled)',
+    P21_MOCK.pendingAlarms === 0, 'alarms=' + P21_MOCK.pendingAlarms);
+  check('[21] three storageSet attempts (primary + compact + minimal)',
+    p21Writes === 3, 'writes=' + p21Writes);
+
+  // 21b: requestScan — same all-reject boundary through the user-facing entry.
+  const P21B_MOCK = new MockChrome(tree);
+  const P21B_DEPS = P21B_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules),
+    storageSet: () => Promise.reject(new Error('total storage failure'))
+  });
+  const p21bCtrl = createScanController(P21B_DEPS);
+  let p21bResult;
+  let p21bThrew = false;
+  try {
+    p21bResult = await p21bCtrl.requestScan();
+  } catch (e) { p21bThrew = true; }
+  check('[21] requestScan all-writes-reject does NOT throw', p21bThrew === false, 'threw=' + p21bThrew);
+  check('[21] requestScan returns {failed:true, phase:FAILED, error}',
+    p21bResult && p21bResult.failed === true && p21bResult.phase === constants.PHASE.FAILED &&
+    typeof p21bResult.error === 'string' && p21bResult.error.length > 0,
+    JSON.stringify(p21bResult));
+  check('[21] requestScan clearWake called (no alarm scheduled)',
+    P21B_MOCK.pendingAlarms === 0, 'alarms=' + P21B_MOCK.pendingAlarms);
+
+  // 21c: Execute the REAL service-worker.js scan-now listener in a VM context
+  // with all-storageSet-rejecting chrome, asserting the actual sendResponse.
+  {
+    const p21cStore = Object.create(null);
+    const p21cListeners = [];
+    let p21cAlarms = 0;
+    const p21cModMap = {
+      '../shared/constants.js': 'BRConstants', '../shared/normalize.js': 'BRNormalize',
+      '../shared/categorize.js': 'BRCategorize', '../shared/cleanup.js': 'BRCleanup',
+      '../shared/backup.js': 'BRBackup', '../shared/link-checker.js': 'BRLinks',
+      '../shared/report.js': 'BRReport', '../shared/trash.js': 'BRTrash',
+      '../shared/messaging.js': 'BRMessaging', '../shared/scan-controller.js': 'BRScan'
+    };
+    const p21cSandbox = {
+      console, Buffer, setTimeout, clearTimeout, queueMicrotask,
+      Promise, Error, Object, Array, JSON, Math, Date, RegExp, String,
+      Number, Boolean, Map, Set, parseInt, parseFloat, isNaN, isFinite,
+      encodeURIComponent, decodeURIComponent,
+      fetch: () => Promise.resolve({ ok: true, json: () => Promise.resolve(rules) }),
+      chrome: {
+        runtime: {
+          id: 'ext-p21c', getURL: (p) => 'chrome-extension://ext-p21c/' + p,
+          sendMessage: () => Promise.resolve(),
+          onMessage: { addListener: (fn) => p21cListeners.push(fn) },
+          onInstalled: { addListener: () => {} }
+        },
+        alarms: { onAlarm: { addListener: () => {} }, create: () => { p21cAlarms++; }, clear: () => Promise.resolve(true) },
+        permissions: { contains: () => Promise.resolve(false) },
+        storage: { local: {
+          get: (keys) => {
+            const arr = Array.isArray(keys) ? keys : [keys];
+            return Promise.resolve(arr.reduce((o, k) => { if (k in p21cStore) { o[k] = p21cStore[k]; } return o; }, {}));
+          },
+          set: () => Promise.reject(new Error('total storage failure'))
+        } },
+        bookmarks: {
+          getTree: () => Promise.resolve(JSON.parse(JSON.stringify(tree))),
+          get: (id) => Promise.resolve(null),
+          create: (o) => Promise.resolve({ id: 'new', title: o.title, parentId: o.parentId }),
+          move: (id, o) => Promise.resolve({ id: id, parentId: o.parentId }),
+          remove: (id) => Promise.resolve()
+        }
+      }
+    };
+    p21cSandbox.importScripts = (...paths) => paths.forEach((p) => {
+      if (p21cModMap[p]) { p21cSandbox[p21cModMap[p]] = require(p); }
+    });
+    const p21cCtx = vm.createContext(p21cSandbox);
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'background', 'service-worker.js'), 'utf8'),
+      p21cCtx, { filename: 'service-worker.js' });
+    const p21cListener = p21cListeners[0];
+    check('[21c] actual SW scan-now: listener registered', typeof p21cListener === 'function',
+      'count=' + p21cListeners.length);
+    const p21cResp = await new Promise((resolve) => {
+      let r;
+      p21cListener({ type: 'scan-now' },
+        { id: 'ext-p21c', url: 'chrome-extension://ext-p21c/popup.html' },
+        (v) => { r = v; });
+      queueMicrotask(() => setTimeout(() => resolve(r), 30));
+    });
+    check('[21c] actual SW scan-now: sendResponse is {ok:false, phase:FAILED, error}',
+      p21cResp && p21cResp.ok === false && p21cResp.phase === constants.PHASE.FAILED &&
+      typeof p21cResp.error === 'string' && p21cResp.error.length > 0,
+      JSON.stringify(p21cResp));
+    check('[21c] actual SW scan-now: no alarm scheduled (no wake)',
+      p21cAlarms === 0, 'alarms=' + p21cAlarms);
+  }
+
+  // 21d: After storage recovers, a later scan must succeed.
+  const P21_OK_MOCK = new MockChrome(tree);
+  const p21okCtrl = createScanController(P21_OK_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  await p21okCtrl.startNewScan();
+  const p21okSnap = P21_OK_MOCK.snapshot();
+  const p21okCp = p21okSnap[constants.KEYS.CHECKPOINT];
+  check('[21] retry after all-writes-reject reaches DONE',
+    p21okCp && p21okCp.phase === constants.PHASE.DONE,
+    'phase=' + (p21okCp && p21okCp.phase));
+  check('[21] retry produces complete records',
+    (p21okSnap[constants.KEYS.RECORDS] || []).length === queue.length,
+    'records=' + (p21okSnap[constants.KEYS.RECORDS] || []).length);
+  check('[21] retry produces a report',
+    !!p21okSnap[constants.KEYS.REPORT], '');
+
+  // ---- Footprint probe: measure snapshot JSON bytes per record ---------------
+  // Deterministic assertion: the snapshot JSON size scales linearly and stays
+  // within the expected per-record budget. This catches schema bloat early.
+  console.log('\n[Footprint] snapshot JSON byte measurement.');
+  const fullSnapBytes = Buffer.byteLength(JSON.stringify(fullSnap), 'utf8');
+  const fullRecords = (fullSnap[constants.KEYS.RECORDS] || []);
+  const perRecord = fullRecords.length > 0 ? fullSnapBytes / fullRecords.length : 0;
+  console.log('  snapshot bytes=' + fullSnapBytes + ' records=' + fullRecords.length + ' bytes/record=' + perRecord.toFixed(2));
+  check('footprint: snapshot JSON is under 10 MB for ' + count + ' records',
+    fullSnapBytes < 10 * 1024 * 1024, 'bytes=' + fullSnapBytes);
+  check('footprint: per-record bytes are under 1000',
+    perRecord < 1000, 'bytes/record=' + perRecord.toFixed(2));
 
   // ---- Print the human-readable Library Report ----------------------------------
   console.log('\n==== Library Report ====');

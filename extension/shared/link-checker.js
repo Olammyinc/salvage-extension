@@ -1,11 +1,11 @@
 /**
- * Dead-link checking — Milestone 2.
+ * Dead-link checking.
  *
  * Detection runs ONLY on explicit user opt-in, and ONLY after the extension
  * holds the optional `<all_urls>` host permission. It is never run during the
  * library scan and never fetches a bookmarked URL automatically.
  *
- * Results are strictly three-state (FR5): `reachable`, `unreachable`,
+ * Results are strictly three-state: `reachable`, `unreachable`,
  * `could_not_check`. Only a confirmed dead response (HTTP 404 or 410) may be
  * reported `unreachable`. 401/403/429/5xx, unresolved redirects, network/CORS
  * failures, challenges, and timeouts are all `could_not_check` — never

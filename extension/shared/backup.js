@@ -1,5 +1,5 @@
 /**
- * Backup export — pure logic, Milestone 2.
+ * Backup export — pure logic.
  *
  * Builds a restorable, versioned JSON export of the full bookmark tree.
  * The export is generated from `chrome.bookmarks.getTree()` output (the tree

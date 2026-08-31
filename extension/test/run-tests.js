@@ -130,7 +130,7 @@ const cliFailures = generatorCli();
 
 // Netscape bookmark-HTML output: prove the serializer round-trips and that
 // realistic mode emits a sparse LAST_VISIT set (it does NOT, by itself, prove
-// the browser will import or honor LAST_VISIT — see MANUAL-VERIFICATION.md).
+  // the browser will import or honor LAST_VISIT).
 function generatorHtml() {
   const path = require('path');
   const generator = require('../tools/generator.js');
@@ -228,5 +228,6 @@ const htmlFailures = generatorHtml();
 if (htmlFailures > 0) { process.exitCode = 1; }
 run('unit-tests', ['test/unit-tests.js']);
 run('branding-tests', ['test/branding-tests.js']);
+run('firefox-tests', ['test/firefox-tests.js']);
 run('popup-tests', ['test/popup-tests.js']);
 run('harness (' + count + ' items, seed ' + seed + ')', ['test/harness.js', count, seed]);

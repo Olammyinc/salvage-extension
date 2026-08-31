@@ -1,7 +1,7 @@
 /**
  * Scan controller — chunked, checkpointed, resumable bookmark import.
  *
- * Design constraints (TECHNICAL-ARCHITECTURE.md §A):
+ * Design constraints:
  *   - No global scan state. Everything needed to resume is read from and
  *     written to storage on every wake.
  *   - The scan runs in chunks (~75 links) and checkpoints after every chunk.
@@ -9,7 +9,7 @@
  *   - Terminating the worker mid-scan at any point must leave a resume that
  *     completes with identical final counts (idempotent; reprocessing a chunk
  *     is harmless).
- *   - What remained for later milestones (deletion, writes, network checks)
+ *   - What remains out of scope (deletion, writes, network checks)
  *     is intentionally out of scope here.
  *
  * To make the chunk/checkpoint/resume logic verifiable without Chrome, all
@@ -143,8 +143,8 @@
 
     /**
      * Convert a work item into a persisted bookmark record matching the
-     * architecture's storage schema (TECHNICAL-ARCHITECTURE.md §5). Fields
-     * that describe work out of Milestone 1 scope are carried as honest
+     * architecture's storage schema. Fields
+     * that describe work out of scope are carried as honest
      * neutral placeholders (deletedAt null, linkStatus unchecked).
      */
     function itemToRecord(item, rules, now) {
@@ -238,7 +238,7 @@
         .then(function (nodes) {
           var rootNodes = nodes || [];
           var queue = flattenTree(rootNodes, []);
-          // Milestone 2 detection: derive the read-only tree analysis (empty
+          // Detection: derive the read-only tree analysis (empty
           // folders + same-name merge candidates) now, while we hold the tree.
           // It is persisted alongside the scan queue so a worker-terminated and
           // resumed scan still reports the same folder findings at completion.
@@ -272,10 +272,49 @@
             scanStartedAt: getNow()
           };
           payload[KEYS.SCHEMA] = SCHEMA_VERSION;
-          return storageSet(payload);
-        })
-        .then(function () {
-          return processActiveWindowImpl(rules);
+          return storageSet(payload)
+            .then(function () {
+              return processActiveWindowImpl(rules);
+            })
+            .catch(async function (writeErr) {
+              // The initial scan write failed (e.g. storage quota). Persist a
+              // terminal FAILED checkpoint with error detail. Best-effort: clear
+              // the queue/records so the failed checkpoint can fit; that fallback
+              // itself must never throw. All writes are properly awaited so a
+              // rejected compact fallback triggers the minimal fallback.
+              var errMsg = (writeErr && typeof writeErr.message === 'string') ? writeErr.message : String(writeErr);
+              var failedCp = {
+                phase: PHASE.FAILED,
+                totalCount: queue.length,
+                processedCount: 0,
+                lastProcessedId: null,
+                updatedAt: getNow(),
+                scanStartedAt: getNow(),
+                error: errMsg
+              };
+              var persisted = false;
+              try {
+                var failPayload = {};
+                failPayload[KEYS.CHECKPOINT] = failedCp;
+                failPayload[KEYS.QUEUE] = [];
+                failPayload[KEYS.RECORDS] = [];
+                failPayload[KEYS.SCHEMA] = SCHEMA_VERSION;
+                await storageSet(failPayload);
+                persisted = true;
+              } catch (_) {
+                try {
+                  var minimal = {};
+                  minimal[KEYS.CHECKPOINT] = failedCp;
+                  minimal[KEYS.SCHEMA] = SCHEMA_VERSION;
+                  await storageSet(minimal);
+                  persisted = true;
+                } catch (_) {}
+              }
+              clearWake();
+              if (!persisted) {
+                return { failed: true, phase: PHASE.FAILED, error: errMsg };
+              }
+            });
         });
     }
 
@@ -296,81 +335,158 @@
         if (cp.phase === PHASE.SCANNING) {
           return { skipped: true, phase: cp.phase };
         }
-        return startNewScanImpl().then(function () { return { skipped: false }; });
+        return startNewScanImpl().then(function (res) {
+          if (res && res.failed) { return res; }
+          return { skipped: false };
+        });
       });
     }
 
     /**
      * Resume an incomplete scan (worker restarted mid-scan), or do nothing if
-     * the scan is already done. Called from the top level on worker startup
-     * and from onAlarm.
+     * the scan is already done or has failed. Called from the top level on
+     * worker startup and from onAlarm.
      */
-    function resumeImpl() {
-      return readCheckpoint().then(function (cp) {
-        if (cp.phase === PHASE.SCANNING && cp.processedCount < cp.totalCount) {
-          return loadRules().then(function (rules) {
-            return processActiveWindowImpl(rules);
-          });
+    async function resumeImpl() {
+      try {
+        var cp = await readCheckpoint();
+        if (cp.phase === PHASE.SCANNING) {
+          var rules = await loadRules();
+          return await processActiveWindowImpl(rules);
         }
         return null;
-      });
+      } catch (err) {
+        // Any resume error (checkpoint read, rules load, or processing) is
+        // funnelled into a best-effort FAILED transition so the scan is never
+        // left stranded at SCANNING with no alarm.
+        var errMsg = (err && typeof err.message === 'string') ? err.message : String(err);
+        var persisted = false;
+        try {
+          var failPayload = {};
+          failPayload[KEYS.CHECKPOINT] = {
+            phase: PHASE.FAILED,
+            totalCount: 0,
+            processedCount: 0,
+            lastProcessedId: null,
+            updatedAt: getNow(),
+            scanStartedAt: null,
+            error: errMsg
+          };
+          failPayload[KEYS.SCHEMA] = SCHEMA_VERSION;
+          await storageSet(failPayload);
+          persisted = true;
+        } catch (_) {}
+        clearWake();
+        if (!persisted) {
+          return { failed: true, phase: PHASE.FAILED, error: errMsg };
+        }
+      }
     }
 
     /**
      * Compute and persist the Library Report once the scan reaches the end.
      */
     async function finishScan(cp) {
-      var res = await storageGet([KEYS.RECORDS, KEYS.FOLDER_FINDINGS]);
-      var records = res[KEYS.RECORDS] || [];
-      // The tree-derived folder findings were persisted at scan start. If none
-      // are present (e.g. a resume from a pre-M2 checkpoint) the report simply
-      // carries zero empty-folder / merge findings.
-      var folderFindings = res[KEYS.FOLDER_FINDINGS] || null;
-      var now = getNow();
-      // M3 trash integration: a fresh rescan rebuilds records from the live tree
-      // (which still contains items under Salvage Trash). Re-apply the soft-delete
-      // marker to any record whose bookmark is currently tracked, non-restored, in
-      // Salvage Trash, so trashed items are never re-offered for cleanup and their
-      // copies never re-inflate duplicate/link metrics — even though the bookmark
-      // itself remains in the tree under Salvage Trash.
-      if (loadTrashDeletedIds) {
-        var trashedIds = await loadTrashDeletedIds();
-        if (trashedIds && trashedIds.length) {
-          var set = {};
-          trashedIds.forEach(function (id) { set[String(id)] = true; });
-          records.forEach(function (r) { if (set[String(r.id)]) { r.deletedAt = now; } });
-        }
-      }
-      // Exact wall-clock scan duration. When a start timestamp exists (the scan
-      // was instrumented), the duration spans the full elapsed time across all
-      // wakes — including any that were interrupted by worker termination. When
-      // it is absent (resume from an older checkpoint without a start stamp) we
-      // fall back to the completed timestamp with a null duration rather than
-      // fabricating one.
+      // The entire finalization pipeline (reads, deleted-id loading, report
+      // computation, and DONE persistence) is wrapped in a single try/catch.
+      // Any failure — not just the final storageSet — is terminal: persist
+      // FAILED with an actionable error, clear the alarm, and never throw.
+      // Without this, a storageGet/loadTrashDeletedIds/computeReport rejection
+      // would leave the checkpoint at SCANNING with processed==total and no
+      // alarm, wedging the scan until an external resume.
       var scanStartedAt = (typeof cp.scanStartedAt === 'number') ? cp.scanStartedAt : null;
-      var scanCompletedAt = now;
-      var durationMs = (scanStartedAt !== null) ? Math.max(0, scanCompletedAt - scanStartedAt) : null;
-      var payload = {};
-      payload[KEYS.REPORT] = report.computeReport(records, now, {
-        folderFindings: folderFindings,
-        timing: { scanStartedAt: scanStartedAt, scanCompletedAt: scanCompletedAt, durationMs: durationMs }
-      });
-      payload[KEYS.RECORDS] = records;
-      payload[KEYS.LAST_SCAN] = now;
-      payload[KEYS.CHECKPOINT] = {
-        phase: PHASE.DONE,
-        totalCount: cp.totalCount,
-        processedCount: cp.totalCount,
-        lastProcessedId: cp.lastProcessedId,
-        updatedAt: now,
-        scanStartedAt: scanStartedAt,
-        scanCompletedAt: scanCompletedAt,
-        durationMs: durationMs
-      };
-      await storageSet(payload);
-      clearWake();
-      sendProgress({ phase: PHASE.DONE, processedCount: cp.totalCount, totalCount: cp.totalCount });
-      return payload;
+      try {
+        var res = await storageGet([KEYS.RECORDS, KEYS.FOLDER_FINDINGS]);
+        var records = res[KEYS.RECORDS] || [];
+        // The tree-derived folder findings were persisted at scan start. If none
+        // are present (e.g. a resume from a pre-M2 checkpoint) the report simply
+        // carries zero empty-folder / merge findings.
+        var folderFindings = res[KEYS.FOLDER_FINDINGS] || null;
+        var now = getNow();
+        // M3 trash integration: a fresh rescan rebuilds records from the live tree
+        // (which still contains items under Salvage Trash). Re-apply the soft-delete
+        // marker to any record whose bookmark is currently tracked, non-restored, in
+        // Salvage Trash, so trashed items are never re-offered for cleanup and their
+        // copies never re-inflate duplicate/link metrics — even though the bookmark
+        // itself remains in the tree under Salvage Trash.
+        if (loadTrashDeletedIds) {
+          var trashedIds = await loadTrashDeletedIds();
+          if (trashedIds && trashedIds.length) {
+            var set = {};
+            trashedIds.forEach(function (id) { set[String(id)] = true; });
+            records.forEach(function (r) { if (set[String(r.id)]) { r.deletedAt = now; } });
+          }
+        }
+        // Exact wall-clock scan duration. When a start timestamp exists (the scan
+        // was instrumented), the duration spans the full elapsed time across all
+        // wakes — including any that were interrupted by worker termination. When
+        // it is absent (resume from an older checkpoint without a start stamp) we
+        // fall back to the completed timestamp with a null duration rather than
+        // fabricating one.
+        var scanCompletedAt = now;
+        var durationMs = (scanStartedAt !== null) ? Math.max(0, scanCompletedAt - scanStartedAt) : null;
+        var payload = {};
+        payload[KEYS.REPORT] = report.computeReport(records, now, {
+          folderFindings: folderFindings,
+          timing: { scanStartedAt: scanStartedAt, scanCompletedAt: scanCompletedAt, durationMs: durationMs }
+        });
+        payload[KEYS.RECORDS] = records;
+        payload[KEYS.LAST_SCAN] = now;
+        payload[KEYS.CHECKPOINT] = {
+          phase: PHASE.DONE,
+          totalCount: cp.totalCount,
+          processedCount: cp.totalCount,
+          lastProcessedId: cp.lastProcessedId,
+          updatedAt: now,
+          scanStartedAt: scanStartedAt,
+          scanCompletedAt: scanCompletedAt,
+          durationMs: durationMs
+        };
+        await storageSet(payload);
+        clearWake();
+        sendProgress({ phase: PHASE.DONE, processedCount: cp.totalCount, totalCount: cp.totalCount });
+        return payload;
+      } catch (err) {
+        // Any finalization failure (storageGet, loadTrashDeletedIds,
+        // computeReport, or storageSet) is terminal. Persist a FAILED
+        // checkpoint with error detail so the popup can surface it and a
+        // later startNewScan starts cleanly. Best-effort: clear stored
+        // scan work (queue, records) so the failed checkpoint can fit;
+        // that fallback itself must never throw.
+        var errMsg = (err && typeof err.message === 'string') ? err.message : String(err);
+        var failedCp = {
+          phase: PHASE.FAILED,
+          totalCount: cp.totalCount,
+          processedCount: cp.totalCount,
+          lastProcessedId: cp.lastProcessedId,
+          updatedAt: getNow(),
+          scanStartedAt: scanStartedAt,
+          error: errMsg
+        };
+        var persisted = false;
+        try {
+          var failPayload = {};
+          failPayload[KEYS.CHECKPOINT] = failedCp;
+          failPayload[KEYS.QUEUE] = [];
+          failPayload[KEYS.RECORDS] = [];
+          failPayload[KEYS.SCHEMA] = SCHEMA_VERSION;
+          await storageSet(failPayload);
+          persisted = true;
+        } catch (_) {
+          try {
+            var minimal = {};
+            minimal[KEYS.CHECKPOINT] = failedCp;
+            minimal[KEYS.SCHEMA] = SCHEMA_VERSION;
+            await storageSet(minimal);
+            persisted = true;
+          } catch (_) {}
+        }
+        clearWake();
+        if (!persisted) {
+          return { failed: true, phase: PHASE.FAILED, error: errMsg };
+        }
+        return;
+      }
     }
 
     /**
@@ -387,10 +503,43 @@
      * driver.
      */
     async function processActiveWindowImpl(rules) {
-      var cp = await readCheckpoint();
-      // An idle or done scan has nothing left to do (idempotent replay).
+      var cp;
+      try {
+        cp = await readCheckpoint();
+      } catch (readErr) {
+        // Checkpoint read failed — emit a minimal FAILED checkpoint with safe
+        // defaults so the scan is never left stranded at SCANNING.
+        var errMsg = (readErr && typeof readErr.message === 'string') ? readErr.message : String(readErr);
+        var persisted = false;
+        try {
+          var failPayload = {};
+          failPayload[KEYS.CHECKPOINT] = {
+            phase: PHASE.FAILED,
+            totalCount: 0,
+            processedCount: 0,
+            lastProcessedId: null,
+            updatedAt: getNow(),
+            scanStartedAt: null,
+            error: errMsg
+          };
+          failPayload[KEYS.SCHEMA] = SCHEMA_VERSION;
+          await storageSet(failPayload);
+          persisted = true;
+        } catch (_) {}
+        clearWake();
+        if (!persisted) {
+          return { failed: true, phase: PHASE.FAILED, error: errMsg };
+        }
+        return;
+      }
+      // An idle, done, or failed scan has nothing left to do (idempotent replay).
       if (cp.phase !== PHASE.SCANNING) {
-        await writeCheckpoint(cp); // no-op; keep schema stamped
+        if (cp.phase !== PHASE.FAILED) {
+          // No-op schema-stamp write: keep the schema version current. This is
+          // nonessential — a rejection must NOT propagate into the caller's
+          // error handling or downgrade a completed checkpoint to FAILED.
+          try { await writeCheckpoint(cp); } catch (_) {}
+        }
         return;
       }
       // Still in the scanning phase but already at (or past) the end: either
@@ -409,7 +558,35 @@
         : constants.ACTIVE_WINDOW_MS;
       var wakeStart = getNow();
 
-      var res = await storageGet([KEYS.QUEUE, KEYS.RECORDS]);
+      var res;
+      try {
+        res = await storageGet([KEYS.QUEUE, KEYS.RECORDS]);
+      } catch (readErr) {
+        // Queue/records read failed — persist a FAILED checkpoint using the
+        // checkpoint's known counts so the scan is never left stranded.
+        var errMsg = (readErr && typeof readErr.message === 'string') ? readErr.message : String(readErr);
+        var persisted = false;
+        try {
+          var failPayload = {};
+          failPayload[KEYS.CHECKPOINT] = {
+            phase: PHASE.FAILED,
+            totalCount: cp.totalCount,
+            processedCount: cp.processedCount,
+            lastProcessedId: cp.lastProcessedId,
+            updatedAt: getNow(),
+            scanStartedAt: cp.scanStartedAt,
+            error: errMsg
+          };
+          failPayload[KEYS.SCHEMA] = SCHEMA_VERSION;
+          await storageSet(failPayload);
+          persisted = true;
+        } catch (_) {}
+        clearWake();
+        if (!persisted) {
+          return { failed: true, phase: PHASE.FAILED, error: errMsg };
+        }
+        return;
+      }
       var queue = res[KEYS.QUEUE] || [];
       var now = getNow();
       var cursor = cp.processedCount;
@@ -447,7 +624,51 @@
           // termination/wake never loses it and the final duration stays exact.
           scanStartedAt: cp.scanStartedAt
         };
-        await storageSet(batch);
+
+        try {
+          await storageSet(batch);
+        } catch (writeErr) {
+          // Chunk write failed (e.g. storage quota exceeded). Persist a terminal
+          // FAILED checkpoint with error detail so the popup can surface it and
+          // a later startNewScan starts cleanly. Best-effort: clear stored scan
+          // work (queue, records) in a second write so the failed checkpoint can
+          // fit even after quota exhaustion; that fallback itself must never throw.
+          var errMsg = (writeErr && typeof writeErr.message === 'string') ? writeErr.message : String(writeErr);
+          var failedCp = {
+            phase: PHASE.FAILED,
+            totalCount: cp.totalCount,
+            processedCount: cursor,
+            lastProcessedId: lastId,
+            updatedAt: getNow(),
+            scanStartedAt: cp.scanStartedAt,
+            error: errMsg
+          };
+          var persisted = false;
+          try {
+            var failPayload = {};
+            failPayload[KEYS.CHECKPOINT] = failedCp;
+            failPayload[KEYS.QUEUE] = [];
+            failPayload[KEYS.RECORDS] = [];
+            failPayload[KEYS.SCHEMA] = SCHEMA_VERSION;
+            await storageSet(failPayload);
+            persisted = true;
+          } catch (_) {
+            // The fallback itself failed (extreme quota exhaustion). Write only
+            // the checkpoint so at minimum the phase is terminal.
+            try {
+              var minimal = {};
+              minimal[KEYS.CHECKPOINT] = failedCp;
+              minimal[KEYS.SCHEMA] = SCHEMA_VERSION;
+              await storageSet(minimal);
+              persisted = true;
+            } catch (_) {}
+          }
+          clearWake();
+          if (!persisted) {
+            return { failed: true, phase: PHASE.FAILED, error: errMsg };
+          }
+          return;
+        }
 
         res[KEYS.RECORDS] = merged; // keep local accumulated copy for next chunk
         cursor = nextCursor;

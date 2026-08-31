@@ -5,18 +5,23 @@
  * and chrome.runtime messages. All scan progress and state live in
  * chrome.storage; no in-memory scan state is kept in this module.
  */
-importScripts(
-  '../shared/constants.js',
-  '../shared/normalize.js',
-  '../shared/categorize.js',
-  '../shared/cleanup.js',
-  '../shared/backup.js',
-  '../shared/link-checker.js',
-  '../shared/report.js',
-  '../shared/trash.js',
-  '../shared/messaging.js',
-  '../shared/scan-controller.js'
-);
+// In Firefox (background.scripts), the shared modules are loaded as classic
+// scripts before this file, so their globals already exist.  In Chromium
+// (background.service_worker) we must import them ourselves.
+if (typeof BRConstants === 'undefined') {
+  importScripts(
+    '../shared/constants.js',
+    '../shared/normalize.js',
+    '../shared/categorize.js',
+    '../shared/cleanup.js',
+    '../shared/backup.js',
+    '../shared/link-checker.js',
+    '../shared/report.js',
+    '../shared/trash.js',
+    '../shared/messaging.js',
+    '../shared/scan-controller.js'
+  );
+}
 
 const { KEYS, PHASE, ALARM_NAME, LINK_ALARM_NAME, ALARM_MINUTES } = BRConstants;
 const { createScanController } = BRScan;
@@ -80,7 +85,7 @@ function handleResume() {
   });
 }
 
-// Permissions-gated, chunked link checker (Milestone 2). Lazy-created like the
+// Permissions-gated, chunked link checker. Lazy-created like the
 // scan controller; the check runs only after the popup has obtained the
 // optional <all_urls> host permission.
 let linkController = null;
@@ -111,7 +116,7 @@ function handleLinkResume() {
   });
 }
 
-// Milestone 3 safe cleanup / Salvage Trash controller. Lazy-created like the
+// Safe cleanup / Salvage Trash controller. Lazy-created like the
 // others; serialized internally so bulk move / restore / undo / purge never
 // overlap on the same real bookmark tree. It uses only the existing
 // `bookmarks` permission (no new host permissions).
@@ -179,7 +184,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // overlapping writes; this layers on dedup so the scan cannot loop).
       getController()
         .requestScan()
-        .then((res) => sendResponse({ ok: true, skipped: !!(res && res.skipped) }))
+        .then((res) => {
+          // When every storageSet write in the scan failure path rejected, the
+          // controller returns {failed:true, phase:PHASE.FAILED, error} without
+          // throwing. Map that to ok:false so the popup displays COPY.scanFailed
+          // and re-enables the Scan now button immediately (no storage event
+          // needed).
+          if (res && res.failed) {
+            sendResponse({ ok: false, phase: res.phase || PHASE.FAILED, error: res.error || 'scan failed' });
+          } else {
+            sendResponse({ ok: true, skipped: !!(res && res.skipped), phase: (res && res.phase) || null });
+          }
+        })
         .catch((err) => sendResponse({ ok: false, error: String(err && err.message) }));
       return true; // async response
 
@@ -190,7 +206,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return false;
 
     case 'backup-export':
-      // Full, never-partial backup export (Milestone 2, FR10). Grabs the
+      // Full, never-partial backup export. Grabs the
       // complete bookmark tree and serializes it to a restorable JSON string.
       // The popup downloads it as a file — no extra download permission needed.
       chrome.bookmarks
@@ -224,7 +240,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         .catch((err) => sendResponse({ ok: false, error: String(err && err.message) }));
       return true; // async response
 
-    // ---- Milestone 3: safe cleanup / Salvage Trash ---------------------------
+    // ---- Safe cleanup / Salvage Trash ----------------------------------------
 
     case 'trash-status':
       getTrashController()

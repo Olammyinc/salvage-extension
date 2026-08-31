@@ -13,7 +13,11 @@ const constants = require('../shared/constants');
 const linkUi = require('../shared/link-check-ui');
 const trash = require('../shared/trash');
 const messaging = require('../shared/messaging');
+const scanCtrl = require('../shared/scan-controller');
 const rules = require('../shared/rules-data.json');
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -54,7 +58,7 @@ check('neutral fallback when nothing matches',
 check('fallback is the neutral default category',
   categorize.categorize({ url: 'https://q.com/z', title: '' }, rules).category === constants.DEFAULT_CATEGORY);
 check('fallback is not any of the known topic categories',
-  constants.CATEGORIES_THIS_MILESTONE.indexOf(categorize.categorize({ url: 'https://q.com/z', title: '' }, rules).category) !== -1);
+  constants.CATEGORIES.indexOf(categorize.categorize({ url: 'https://q.com/z', title: '' }, rules).category) !== -1);
 check('keyword rule beats fallback', categorize.categorize({ url: 'https://q.com/z', title: 'javascript tutorial' }, rules).category !== 'Other');
 
 console.log('[report]');
@@ -99,7 +103,7 @@ check('long-added record with no dateLastUsed is not stale (id6)',
 console.log('[report] oldest bookmark is preserved and is a record');
 check('oldest has a title/url', !!r[constants.METRIC.OLDEST].title && !!r[constants.METRIC.OLDEST].url);
 
-// ---- Milestone 2: cleanup duplicate groups ----------------------------------
+// ---- Cleanup duplicate groups -------------------------------------------------
 console.log('[cleanup] duplicate groups (excluding soft-deleted)');
 const m2rec = (id, url, opts) => Object.assign({
   id, url, title: 't' + id, dateAdded: NOW, deletedAt: null, category: 'Development'
@@ -132,7 +136,7 @@ check('folder normalization is conservative (trim/lower/collapse)',
   cleanup.normalizeFolderName('A  B') === 'a b', '');
 check('duplicate groups ignore non-URL records', cleanup.computeDuplicateGroups([m2rec('x', 'not a url')]).groupCount === 0, '');
 
-// ---- Milestone 2: report carries the duplicate list detail --------------------
+// ---- Report carries the duplicate list detail --------------------------------
 console.log('[report] duplicate groups are surfaced in the report');
 const reportWithDup = report.computeReport(dupRecords, NOW, {
   folderFindings: cleanup.analyzeFolders([])
@@ -142,7 +146,7 @@ check('report duplicateGroupsList carries 1 group', (reportWithDup[constants.MET
 check('duplicate list items are read-only ducks (no live fields)',
   reportWithDup[constants.METRIC.DUPLICATE_GROUPS_LIST][0].items[0].duplicateGroup === undefined, '');
 
-// ---- Milestone 2: empty folders + same-name merge ----------------------------
+// ---- Empty folders + same-name merge -----------------------------------------
 console.log('[cleanup] empty folders and same-name merge detection');
 // Tree snapshot: one empty folder, one empty nested "notes", two folders named
 // "videos" under the SAME parent, two folders named "videos" under DIFFERENT
@@ -181,7 +185,7 @@ check('merge candidates are read-only (never auto-merge, no mutation)',
 check('emptyFolders lists are sorted deterministically (by path)',
   folderFindings.emptyFolders.every((f, idx, arr) => idx === 0 || JSON.stringify(arr[idx - 1].path) <= JSON.stringify(f.path)), '');
 
-// ---- Milestone 2: built-in Chrome root containers are never cleanup findings -
+// ---- Built-in Chrome root containers are never cleanup findings ---------------
 console.log('[cleanup] built-in root containers are never user cleanup findings');
 check('synthetic root (id 0) is a built-in root node', cleanup.isBuiltInRootNode({ id: '0', title: '', parentId: '' }) === true, '');
 check('Bar/Other/Mobile roots (1,2,3 under parentId 0) are built-in root nodes',
@@ -234,7 +238,7 @@ check('user folder path retains its root prefix (behavior preserved)',
   withUserFolderFindings.emptyFolders[0] &&
   JSON.stringify(withUserFolderFindings.emptyFolders[0].path) === JSON.stringify(['Bookmarks bar', 'My Empty Folder']), '');
 
-// ---- Milestone 2: backup export ----------------------------------------------
+// ---- Backup export -----------------------------------------------------------
 console.log('[backup] full, versioned, restorable JSON export');
 const SOME_NOW = Date.UTC(2026, 5, 15, 12, 0, 0);
 const sampleTree = [
@@ -255,8 +259,8 @@ const deepTree = backup.buildBackup(
 check('backup preserves nested tree structure', deepTree.tree[0].children[0].children[0].url === 'https://z.com', '');
 check('backup rejects non-schema objects', backup.isValidBackup({ schema: 'nope', version: 1, tree: [] }) === false, '');
 
-// ---- Milestone 2: link-check classification ----------------------------------
-console.log('[link-checker] three-state classification (FR5)');
+// ---- Link-check classification -----------------------------------------------
+console.log('[link-checker] three-state classification');
 const rch = (status) => links.classify({ kind: 'ok', status });
 check('200 -> reachable', rch(200) === constants.LINK_STATUS_REACHABLE, '');
 check('204 -> reachable', rch(204) === constants.LINK_STATUS_REACHABLE, '');
@@ -274,7 +278,7 @@ check('cors error -> could_not_check', links.classify({ kind: 'cors_error' }) ==
 check('network error -> could_not_check', links.classify({ kind: 'network_error' }) === constants.LINK_STATUS_COULD_NOT_CHECK, '');
 check('null outcome -> could_not_check', links.classify(null) === constants.LINK_STATUS_COULD_NOT_CHECK, '');
 
-// ---- Milestone 3: safe-cleanup eligibility (pure) -------------------------
+// ---- Safe-cleanup eligibility (pure) ----------------------------------------
 // Only non-original members of exact duplicate groups (never the original) and
 // records whose persisted linkStatus is EXACTLY `unreachable` are selectable.
 console.log('[trash] eligibility — duplicates select only non-original copies');
@@ -309,7 +313,7 @@ console.log('[trash] items with no url are never selectable');
 check('duplicate without a url is skipped', trash.selectableDuplicates([{ normalizedUrl: 'x', duplicates: [{ id: 'z', title: 't', url: '' }] }]).length === 0, '');
 check('dead link without a url is skipped', trash.selectableDeadLinks([m3rec('nourl', '', { linkStatus: constants.LINK_STATUS_UNREACHABLE })]).length === 0, '');
 
-// ---- Milestone 3: itemized dry-run (pure) ---------------------------------
+// ---- Itemized dry-run (pure) -------------------------------------------------
 console.log('[trash] buildDryRun itemized preview');
 const dry = trash.buildDryRun([
   { id: 'd1', title: 'dup1', url: 'https://a.com/x', kind: trash.KIND_DUPLICATE },
@@ -323,7 +327,7 @@ check('dry-run itemizes every item (never a summary-only count)', dry.items.leng
 check('dry-run is pure/deterministic (no mutation, stable order)',
   dry.items[0].title === 'dup1' && JSON.stringify(trash.buildDryRun(dry.items)) !== JSON.stringify(dry.items), '');
 
-// ---- Milestone 3: backup gate (pure) --------------------------------------
+// ---- Backup gate (pure) -----------------------------------------------------
 console.log('[trash] backup gate');
 check('gate required until a backup export is recorded',
   trash.backupGateRequired(undefined) === true &&
@@ -332,7 +336,7 @@ check('gate required until a backup export is recorded',
 check('gate cleared once backupExportedAt > 0 persisted',
   trash.backupGateRequired(T_NOW) === false, '');
 
-// ---- Milestone 3: restore target fallback (pure) --------------------------
+// ---- Restore target fallback (pure) -----------------------------------------
 console.log('[trash] resolveRestoreParent — original parent, else Bookmarks Bar');
 const restoreTree = [
   { id: '0', title: '', parentId: '', children: [
@@ -349,7 +353,7 @@ check('restore falls back to the Bookmarks Bar when the original folder is gone'
 check('restore refuses to hang when no fallback id is supplied (still deterministic)',
   trash.resolveRestoreParent({ originalParentId: '20' }, restoreTree, null) === '20', '');
 
-// ---- Milestone 3: retention/purge gate (pure) -----------------------------
+// ---- Retention/purge gate (pure) ---------------------------------------------
 console.log('[trash] retention/purge eligibility');
 const RET_MS = constants.MILLIS_PER_DAY * constants.TRASH_RETENTION_DAYS;
 const recentEntry = { id: 'r', movedAt: T_NOW };                       // moved today
@@ -379,7 +383,7 @@ check('duplicate requested purge ids are deduplicated up front (p eligible exact
 check('a duplicate-id request is refused at most once per unique unknown id',
   dupPurge.refusedCount === 2, 'refused=' + dupPurge.refusedCount);
 
-// ---- Milestone 3: server-side eligibility re-derivation (pure) -------------
+// ---- Server-side eligibility re-derivation (pure) -----------------------------
 // bulkMove must NOT trust requested items; it re-derives the eligible set from
 // the persisted records and refuses any requested id that is not a selectable
 // non-original duplicate copy or a record with linkStatus exactly `unreachable`.
@@ -411,7 +415,7 @@ check('arbitrary / ineligible / forged requested ids are refused (never moved)',
 check('duplicate requested ids collapse (id 4 counted once, still refused once)',
   elig.refusedCount === 4, JSON.stringify(elig));
 
-// ---- Milestone 3: runtime message-boundary gates (pure) ---------------------
+// ---- Runtime message-boundary gates (pure) ------------------------------------
 console.log('[messaging] trusted-sender + explicit purge confirmation gates');
 check('a matching extension sender is trusted',
   messaging.isTrustedSender({ id: 'abc', url: 'chrome-extension://abc/popup.html' }, 'abc') === true, '');
@@ -433,7 +437,7 @@ check('purge is refused without the explicit confirmed sentinel',
 check('purge is confirmed only with the exact sentinel',
   messaging.isConfirmedPurge({ type: 'trash-purge', ids: ['1'], confirmed: 'confirmed' }) === true, '');
 
-// ---- Milestone 2 UI state: the dead-link section renders one state -----------
+// ---- Dead-link section renders one state --------------------------------------
 // linkCheckViewState is the pure, deterministic resolver the popup uses so the
 // idle / running / completed states are mutually exclusive. A freshly-started
 // check must never show the "not checked yet" copy and the "checking links"
@@ -526,6 +530,180 @@ const checkUrlTests = (async () => {
 })();
 
 checkUrlTests.then(() => {
-  console.log('\nUnit results: ' + (failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'));
-  process.exitCode = failures === 0 ? 0 : 1;
+  // ---- Scan controller: all storageSet rejects --------------------------------
+  // When every storageSet write in a scan failure path rejects, the controller
+  // must NOT throw, must clear the wake, and must return an explicit
+  // {failed:true, phase:PHASE.FAILED, error} result. The worker maps that to
+  // {ok:false} so the popup shows COPY.scanFailed and re-enables the button.
+  // After storage recovers, a subsequent scan must succeed.
+  console.log('[scan-controller] all storageSet rejects — no throw, clear wake, explicit failed result');
+
+  (async () => {
+    // Test 1: all storageSet calls reject during requestScan
+    {
+      let wakeCleared = false;
+      const failDeps = {
+        bookmarkApi: { getTree: () => Promise.resolve([{ id: '1', title: 't', url: 'https://a.com' }]) },
+        storageGet: () => Promise.resolve({}),
+        storageSet: () => Promise.reject(new Error('quota exceeded')),
+        loadRules: () => Promise.resolve(rules),
+        scheduleWake: () => {},
+        clearWake: () => { wakeCleared = true; },
+        sendProgress: () => {},
+        getNow: () => NOW
+      };
+      const ctrl = scanCtrl.createScanController(failDeps);
+      let result;
+      let threw = false;
+      try {
+        result = await ctrl.requestScan();
+      } catch (e) { threw = true; }
+      check('all storageSet rejects: no throw', !threw, threw ? 'threw' : '');
+      check('all storageSet rejects: wake cleared', wakeCleared, '');
+      check('all storageSet rejects: result.failed === true', result && result.failed === true, JSON.stringify(result));
+      check('all storageSet rejects: phase is FAILED', result && result.phase === constants.PHASE.FAILED, '');
+      check('all storageSet rejects: has error string', result && typeof result.error === 'string' && result.error.length > 0, result && result.error);
+    }
+
+    // Test 2: actual service-worker scan-now listener (VM) with all storageSet rejecting.
+    // Executes the real background/service-worker.js in a vm.createContext sandbox
+    // with a chrome mock whose storage.local.set always rejects, dispatches a
+    // 'scan-now' message through the real onMessage handler, and asserts the real
+    // sendResponse — catching any regression in service-worker.js itself.
+    {
+      const SW_SRC = fs.readFileSync(path.join(__dirname, '..', 'background', 'service-worker.js'), 'utf8');
+      const MOD_MAP = {
+        '../shared/constants.js': 'BRConstants', '../shared/normalize.js': 'BRNormalize',
+        '../shared/categorize.js': 'BRCategorize', '../shared/cleanup.js': 'BRCleanup',
+        '../shared/backup.js': 'BRBackup', '../shared/link-checker.js': 'BRLinks',
+        '../shared/report.js': 'BRReport', '../shared/trash.js': 'BRTrash',
+        '../shared/messaging.js': 'BRMessaging', '../shared/scan-controller.js': 'BRScan'
+      };
+      const TREE_UT = [{ id: '0', title: '', children: [{ id: '1', title: 'Bar', children: [
+        { id: '2', title: 'A', url: 'https://a.com' }
+      ] }] }];
+
+      function buildSWCtx(makeSet) {
+        const store = Object.create(null);
+        const listeners = [];
+        let alarmsCreated = 0;
+        const sandbox = {
+          console, Buffer, setTimeout, clearTimeout, queueMicrotask,
+          Promise, Error, Object, Array, JSON, Math, Date, RegExp, String,
+          Number, Boolean, Map, Set, parseInt, parseFloat, isNaN, isFinite,
+          encodeURIComponent, decodeURIComponent,
+          fetch: () => Promise.resolve({ ok: true, json: () => Promise.resolve(rules) }),
+          chrome: {
+            runtime: {
+              id: 'ext-ut', getURL: (p) => 'chrome-extension://ext-ut/' + p,
+              sendMessage: () => Promise.resolve(),
+              onMessage: { addListener: (fn) => listeners.push(fn) },
+              onInstalled: { addListener: () => {} }
+            },
+            alarms: { onAlarm: { addListener: () => {} }, create: () => { alarmsCreated++; }, clear: () => Promise.resolve(true) },
+            permissions: { contains: () => Promise.resolve(false) },
+            storage: { local: {
+              get: (keys) => {
+                const arr = Array.isArray(keys) ? keys : [keys];
+                return Promise.resolve(arr.reduce((o, k) => { if (k in store) { o[k] = store[k]; } return o; }, {}));
+              },
+              set: makeSet(store)
+            } },
+            bookmarks: {
+              getTree: () => Promise.resolve(JSON.parse(JSON.stringify(TREE_UT))),
+              get: (id) => Promise.resolve(null),
+              create: (o) => Promise.resolve({ id: 'new', title: o.title, parentId: o.parentId }),
+              move: (id, o) => Promise.resolve({ id: id, parentId: o.parentId }),
+              remove: (id) => Promise.resolve()
+            }
+          }
+        };
+        sandbox.importScripts = (...paths) => paths.forEach((p) => {
+          if (MOD_MAP[p]) { sandbox[MOD_MAP[p]] = require(p); }
+        });
+        const ctx = vm.createContext(sandbox);
+        vm.runInContext(SW_SRC, ctx, { filename: 'service-worker.js' });
+        return { store, listeners, alarms: () => alarmsCreated };
+      }
+
+      function dispatchSW(listener, msg) {
+        return new Promise((resolve) => {
+          let response;
+          listener(msg, { id: 'ext-ut', url: 'chrome-extension://ext-ut/popup.html' },
+            (v) => { response = v; });
+          queueMicrotask(() => setTimeout(() => resolve(response), 30));
+        });
+      }
+
+      // 2a: All storageSet reject — real sendResponse must be {ok:false, phase:FAILED, error}
+      const rej = buildSWCtx(() => () => Promise.reject(new Error('total storage failure')));
+      check('actual SW scan-now: listener registered', typeof rej.listeners[0] === 'function',
+        'count=' + rej.listeners.length);
+      const resp = await dispatchSW(rej.listeners[0], { type: 'scan-now' });
+      check('actual SW scan-now: sendResponse is {ok:false, phase:FAILED, error}',
+        resp && resp.ok === false && resp.phase === constants.PHASE.FAILED &&
+        typeof resp.error === 'string' && resp.error.length > 0, JSON.stringify(resp));
+      check('actual SW scan-now: no alarm scheduled (no wake)',
+        rej.alarms() === 0, 'alarms=' + rej.alarms());
+
+      // 2b: Restore storage, assert subsequent real SW scan-now succeeds
+      const ok = buildSWCtx((s) => (obj) => {
+        Object.keys(obj).forEach((k) => { s[k] = JSON.parse(JSON.stringify(obj[k])); });
+        return Promise.resolve();
+      });
+      const resp2 = await dispatchSW(ok.listeners[0], { type: 'scan-now' });
+      check('actual SW scan-now recovery: sendResponse is {ok:true}',
+        resp2 && resp2.ok === true, JSON.stringify(resp2));
+      check('actual SW scan-now recovery: checkpoint reached DONE',
+        ok.store[constants.KEYS.CHECKPOINT] && ok.store[constants.KEYS.CHECKPOINT].phase === constants.PHASE.DONE,
+        'phase=' + (ok.store[constants.KEYS.CHECKPOINT] && ok.store[constants.KEYS.CHECKPOINT].phase));
+    }
+
+    // Test 3: storage recovery allows next scan
+    {
+      let storageWorking = false;
+      const store = {};
+      const recoveryDeps = {
+        bookmarkApi: { getTree: () => Promise.resolve([{ id: '1', title: 't', url: 'https://a.com' }]) },
+        storageGet: (keys) => {
+          const out = {};
+          (Array.isArray(keys) ? keys : [keys]).forEach((k) => { if (k in store) { out[k] = store[k]; } });
+          return Promise.resolve(out);
+        },
+        storageSet: (obj) => {
+          if (!storageWorking) { return Promise.reject(new Error('quota exceeded')); }
+          Object.keys(obj).forEach((k) => { store[k] = JSON.parse(JSON.stringify(obj[k])); });
+          return Promise.resolve();
+        },
+        loadRules: () => Promise.resolve(rules),
+        scheduleWake: () => {},
+        clearWake: () => {},
+        sendProgress: () => {},
+        getNow: () => NOW
+      };
+      const ctrl = scanCtrl.createScanController(recoveryDeps);
+
+      // First scan: all storageSet reject -> failed
+      let r1; let t1 = false;
+      try { r1 = await ctrl.requestScan(); } catch (e) { t1 = true; }
+      check('recovery: first scan fails without throw', !t1, '');
+      check('recovery: first scan result is failed', r1 && r1.failed === true, JSON.stringify(r1));
+
+      // Storage recovers
+      storageWorking = true;
+
+      // Second scan: succeeds
+      let r2; let t2 = false;
+      try { r2 = await ctrl.requestScan(); } catch (e) { t2 = true; }
+      check('recovery: second scan succeeds without throw', !t2, '');
+      check('recovery: second scan is not failed', !(r2 && r2.failed), JSON.stringify(r2));
+      check('recovery: second scan is not skipped', !(r2 && r2.skipped), JSON.stringify(r2));
+      // Verify records were persisted (scan completed)
+      check('recovery: records persisted after recovery', (store.records || []).length === 1, 'records=' + (store.records || []).length);
+      check('recovery: checkpoint reached DONE', store.checkpoint && store.checkpoint.phase === constants.PHASE.DONE, 'phase=' + (store.checkpoint && store.checkpoint.phase));
+    }
+  })().then(() => {
+    console.log('\nUnit results: ' + (failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'));
+    process.exitCode = failures === 0 ? 0 : 1;
+  });
 });

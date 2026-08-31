@@ -104,7 +104,7 @@
    * records.
    * @param {Array<object>} records
    * @param {number} now  epoch ms (injected for determinism in tests)
-   * @param {object} [extras] optional Milestone 2 detection inputs:
+   * @param {object} [extras] optional detection inputs:
    *   { folderFindings } — the persisted read-only tree analysis produced by
    *   cleanup.analyzeFolders(). When absent, empty-folder / merge metrics are
    *   reported as zero (the scan had no tree-analysis snapshot yet).

@@ -5,7 +5,7 @@
  * Produces a realistic, deterministic bookmark tree (Chrome BookmarkTreeNode
  * shape) for local scanning and the test/verification harness. It is needed
  * to exercise the extension against a 3,000+ item library without a real
- * account, and it is reused by every later milestone.
+ * account, and it is reused by every later feature.
  *
  * The output is deterministic for a given seed: the same seed always
  * produces the same tree, so report assertions are stable.

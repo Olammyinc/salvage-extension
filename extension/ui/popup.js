@@ -75,7 +75,7 @@
   // view state only).
   let activeList = null;
 
-  // ---- Milestone 3 cleanup view state --------------------------------------
+  // ---- Cleanup view state -----------------------------------------------------
   // The selectable items currently shown in a cleanup-capable list (duplicate
   // or confirmed-dead-link result view), plus the user's checkbox selections
   // (NOT preselected — the user decides). Once a move completes we clear this.
@@ -227,7 +227,7 @@
     return items.length;
   }
 
-  // ---- Milestone 3: cleanup selection + dry-run confirmation ------------------
+  // ---- Cleanup selection + dry-run confirmation --------------------------------
 
   // Build the selectable item set from the persisted records filtered by a
   // predicate. Only records the pure trash module considers eligible are ever
@@ -468,7 +468,7 @@
     });
   }
 
-  // ---- Milestone 3: Trash view (restore / undo / eligible purge) -------------
+  // ---- Trash view (restore / undo / eligible purge) ---------------------------
   function openTrash() {
     activeList = null;
     els.report.hidden = true;
@@ -583,8 +583,7 @@
     chrome.runtime.sendMessage({ type: 'trash-purge', ids: eligible, confirmed: 'confirmed' }, (res) => {
       els.confirmPanel.hidden = true;
       if (!res || !res.ok) {
-        if (res && res.code === 'NEEDS_CONFIRMATION') { setStatus(COPY.cleanupMoveFailed); }
-        else { setStatus(COPY.cleanupMoveFailed); }
+        setStatus(COPY.cleanupMoveFailed);
         loadTrash();
         return;
       }
@@ -714,7 +713,7 @@
     });
   }
 
-  // ---- Milestone 2: backup export (always available, never gated) -----------
+  // ---- Backup export (always available, never gated) --------------------------
   function exportBackup() {
     els.status.hidden = false;
     els.status.textContent = COPY.scanStarting;
@@ -741,7 +740,7 @@
     });
   }
 
-  // ---- Milestone 2: dead-link check (opt-in, permission-gated) ---------------
+  // ---- Dead-link check (opt-in, permission-gated) -----------------------------
   // Transient in-session hint that a check was just initiated. It bridges the
   // synchronous gap before the link controller's first durable checkpoint
   // write; from then on the running state is driven by the persisted
@@ -897,14 +896,36 @@
     setScanButtonEnabled(false);
     els.status.hidden = false;
     els.status.textContent = COPY.scanStarting;
-    chrome.runtime.sendMessage({ type: 'scan-now' }, () => {
+    chrome.runtime.sendMessage({ type: 'scan-now' }, (res) => {
       scanRequestPending = false;
+      // Re-evaluate button state after the request completes. If the worker
+      // rejected the request ({ok:false} or no response), re-enable Scan now
+      // immediately and show an actionable failure message so the user can
+      // retry. On success the button stays disabled only if the persisted
+      // phase is genuinely SCANNING; a storage-event update will re-enable
+      // it once the scan reaches DONE/FAILED. This prevents the button from
+      // getting stuck disabled when the request fails before any storage
+      // write occurs.
+      if (!res || res.ok === false) {
+        setScanButtonEnabled(true);
+        els.status.hidden = false;
+        els.status.textContent = COPY.scanFailed;
+        return;
+      }
+      // Success: determine the authoritative phase. When the worker skipped
+      // (already scanning), the response carries the authoritative phase from
+      // the controller's own checkpoint read — prefer it over the popup's
+      // stale snapshot which may pre-date the scan start. For a non-skipped
+      // response the scan just started so phase is SCANNING; fall back to the
+      // persisted snapshot only when the response omits phase (legacy path).
+      var phase = (res && res.phase) || (snapshot.checkpoint && snapshot.checkpoint.phase);
+      setScanButtonEnabled(phase !== PHASE.SCANNING);
     });
   }
 
   /**
    * Re-read the persisted scan snapshot and re-render. Progress always comes
-   * from storage (never from worker memory, per BUILD-HANDOFF). Driven by
+   * from storage (never from worker memory). Driven by
    * chrome.storage.onChanged instead of a timer.
    */
   function refreshFromStorage() {
@@ -927,7 +948,8 @@
       snapshot.records = records;
       // The Scan now button is only idle-able while no scan is running: it is
       // disabled during SCANNING (and while a request is pending) and re-enabled
-      // the moment the scan reaches DONE or after any set of changes clears it.
+      // the moment the scan reaches DONE, FAILED, or after any set of changes
+      // clears it.
       if (!scanRequestPending) {
         setScanButtonEnabled(!(cp && cp.phase === PHASE.SCANNING));
       }
@@ -954,13 +976,19 @@
     if (activeList) { return; }
     const report = snapshot.report;
     if (!report || typeof report[METRIC.TOTAL] !== 'number') {
-      // No scan yet: show empty guidance, or progress. The link-check section
-      // stays visible (and explains it needs a scan) so the opt-in is never
-      // hidden.
+      // No scan yet: show empty guidance, or progress, or failure. The
+      // link-check section stays visible (and explains it needs a scan) so the
+      // opt-in is never hidden.
       const cp = snapshot.checkpoint;
       renderLinkCheck();
       if (cp && cp.phase === PHASE.SCANNING) {
         renderProgress(cp);
+      } else if (cp && cp.phase === PHASE.FAILED) {
+        els.empty.hidden = false;
+        els.report.hidden = true;
+        els.listPanel.hidden = true;
+        els.status.hidden = false;
+        els.status.textContent = COPY.scanFailed;
       } else {
         els.empty.hidden = false;
         els.report.hidden = true;
@@ -993,7 +1021,8 @@
       const cp = snapshot.checkpoint;
       // Seed the button's initial enabled state from the persisted checkpoint so
       // opening the popup mid-scan shows Scan now as disabled (prevents a
-      // fresh-click restart until the running scan settles).
+      // fresh-click restart until the running scan settles). A FAILED scan keeps
+      // the button enabled so the user can retry.
       setScanButtonEnabled(!(cp && cp.phase === PHASE.SCANNING));
       if (cp && cp.phase === PHASE.SCANNING) {
         renderProgress(cp);

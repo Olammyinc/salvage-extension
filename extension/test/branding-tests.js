@@ -1,12 +1,12 @@
 /**
  * Branding split tests (no Chrome).
  *
- * Verifies the Step 2 branding split, per BRAND-PACK.md §12: the SHORT product
- * name ("Salvage") stays the single, user-visible product name in the UI and
- * report copy — read through chrome.i18n.getMessage('extensionName') — while a
- * separate, keyword-bearing extensionListingTitle ("Salvage — Clean Up
- * Duplicate & Broken Bookmarks") is carried ONLY by the manifest `name` field
- * for the Chrome Web Store listing surface.
+ * Verifies the branding split: the SHORT product name ("Salvage") stays the
+ * single, user-visible product name in the UI and report copy — read through
+ * chrome.i18n.getMessage('extensionName') — while a separate, keyword-bearing
+ * extensionListingTitle ("Salvage — Clean Up Duplicate & Broken Bookmarks") is
+ * carried ONLY by the manifest `name` field for the Chrome Web Store listing
+ * surface.
  *
  * Run: node test/branding-tests.js
  */
@@ -27,7 +27,7 @@ const messages = JSON.parse(
   fs.readFileSync(path.join(root, '_locales', 'en', 'messages.json'), 'utf8'));
 
 const SHORT = 'Salvage';
-// Em dash (U+2014) exactly as written in BRAND-PACK.md §12.
+// Em dash (U+2014) in the listing title.
 const LISTING = 'Salvage \u2014 Clean Up Duplicate & Broken Bookmarks';
 
 console.log('[manifest] branding split');

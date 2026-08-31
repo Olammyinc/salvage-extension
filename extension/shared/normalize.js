@@ -9,7 +9,7 @@
  * trailing slash on the empty path, and decode percent-encoded octets so that
  * "https://a.com/x%20y" and "https://a.com/x y" compare equal. Query strings
  * are intentionally PRESERVED: two URLs differing only in query are not exact
- * duplicates in this milestone (near-duplicate detection is out of scope).
+ * duplicates (near-duplicate detection is out of scope).
  */
 (function (root, factory) {
   'use strict';

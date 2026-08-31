@@ -1,5 +1,5 @@
 /**
- * Cleanup detection — pure logic, Milestone 2.
+ * Cleanup detection — pure logic.
  *
  * Detection-only and read-only: this module computes duplicate groups, empty
  * folders, and same-name folder merge candidates. It never mutates a bookmark
