@@ -5,12 +5,36 @@
 # Internal tooling and memory
 /.ijfw/
 /ijfw/
+/.ijfw-*/
 /extension/.ijfw/
 
-# Test and build artifacts
+# Editor and IDE state
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Playwright / MCP / wayland artifacts
 /.playwright-mcp/
 /.wayland-core/
+
+# Build and package artifacts
 salvage-extension.zip
+*.zip
+*.crx
+*.pem
+node_modules/
+dist/
+
+# Test output (keep test source, ignore results)
+test-results/
+coverage/
 
 # Marketing drafts (not part of the extension)
 /marketing/
@@ -20,3 +44,8 @@ RESEARCH-VALIDATION-*.md
 
 # Real-browser test output
 extension/test/real-chrome-results.json
+
+# Secrets and environment
+.env
+.env.*
+*.key
