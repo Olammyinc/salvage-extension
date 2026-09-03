@@ -657,6 +657,42 @@ checkUrlTests.then(() => {
       check('actual SW scan-now recovery: checkpoint reached DONE',
         ok.store[constants.KEYS.CHECKPOINT] && ok.store[constants.KEYS.CHECKPOINT].phase === constants.PHASE.DONE,
         'phase=' + (ok.store[constants.KEYS.CHECKPOINT] && ok.store[constants.KEYS.CHECKPOINT].phase));
+
+      // 2c: resume-scan handler propagates failed controller outcome.
+      // When the scan controller's resume() returns {failed:true, phase:FAILED,
+      // error}, the service-worker must reply {ok:false, phase:FAILED, error}
+      // — not the old always-{ok:true}. This uses a SCANNING checkpoint with
+      // all storageSet rejecting so resume() hits the failure path.
+      const rejResume = buildSWCtx(() => () => Promise.reject(new Error('storage offline')));
+      // Seed a SCANNING checkpoint so resume() enters processActiveWindowImpl.
+      rejResume.store[constants.KEYS.CHECKPOINT] = {
+        phase: constants.PHASE.SCANNING, totalCount: 10, processedCount: 0,
+        lastProcessedId: null, updatedAt: NOW, scanStartedAt: NOW
+      };
+      rejResume.store[constants.KEYS.QUEUE] = [{ id: '1', title: 't', url: 'https://a.com', dateAdded: 0, dateLastUsed: 0, folderPath: [] }];
+      rejResume.store[constants.KEYS.SCHEMA] = constants.SCHEMA_VERSION;
+      const resumeResp = await dispatchSW(rejResume.listeners[0], { type: 'resume-scan' });
+      check('actual SW resume-scan: sendResponse is {ok:false} when controller fails',
+        resumeResp && resumeResp.ok === false, JSON.stringify(resumeResp));
+      check('actual SW resume-scan: phase is FAILED',
+        resumeResp && resumeResp.phase === constants.PHASE.FAILED, JSON.stringify(resumeResp));
+      check('actual SW resume-scan: has error string',
+        resumeResp && typeof resumeResp.error === 'string' && resumeResp.error.length > 0,
+        'error=' + (resumeResp && resumeResp.error));
+
+      // 2d: resume-scan handler returns {ok:true} for normal no-op resume
+      // (checkpoint is DONE, resume is a no-op).
+      const okResume = buildSWCtx((s) => (obj) => {
+        Object.keys(obj).forEach((k) => { s[k] = JSON.parse(JSON.stringify(obj[k])); });
+        return Promise.resolve();
+      });
+      okResume.store[constants.KEYS.CHECKPOINT] = {
+        phase: constants.PHASE.DONE, totalCount: 5, processedCount: 5,
+        lastProcessedId: '5', updatedAt: NOW
+      };
+      const okResumeResp = await dispatchSW(okResume.listeners[0], { type: 'resume-scan' });
+      check('actual SW resume-scan: {ok:true} for normal no-op resume (DONE checkpoint)',
+        okResumeResp && okResumeResp.ok === true, JSON.stringify(okResumeResp));
     }
 
     // Test 3: storage recovery allows next scan
@@ -703,6 +739,197 @@ checkUrlTests.then(() => {
       check('recovery: checkpoint reached DONE', store.checkpoint && store.checkpoint.phase === constants.PHASE.DONE, 'phase=' + (store.checkpoint && store.checkpoint.phase));
     }
   })().then(() => {
+    // ---- Firefox-compatible bar id detection (controller) -------------------
+    // Firefox uses different bookmark root ids ('toolbar_____' for Bookmarks
+    // Toolbar, not '1'). The controller must auto-detect the correct bar id from
+    // the tree on first use. Regression guard for the Trash-button-does-nothing
+    // defect in the Firefox temporary add-on.
+    console.log('[trash] Firefox-compatible bar id auto-detection');
+    return (async () => {
+      const FF_BAR_ID = 'toolbar_____';
+      const FF_ROOT_ID = 'root________';
+      const ffTree = [
+        { id: FF_ROOT_ID, title: '', children: [
+          { id: 'ff-unfiled', title: 'Other Bookmarks', parentId: FF_ROOT_ID, children: [] },
+          { id: FF_BAR_ID, title: 'Bookmarks Toolbar', parentId: FF_ROOT_ID, children: [
+            { id: 'ff-folder-1', title: 'Research', parentId: FF_BAR_ID, children: [
+              { id: 'ff-bm-1', title: 'A', url: 'https://a.com/x', parentId: 'ff-folder-1' },
+              { id: 'ff-bm-2', title: 'A dup', url: 'https://a.com/x', parentId: 'ff-folder-1' }
+            ] }
+          ] }
+        ] }
+      ];
+
+      const CHROME_BAR_ID = '1';
+      const chromeTree = [
+        { id: '0', title: '', children: [
+          { id: '2', title: 'Other Bookmarks', parentId: '0', children: [] },
+          { id: CHROME_BAR_ID, title: 'Bookmarks Bar', parentId: '0', children: [
+            { id: 'chrome-bm-1', title: 'B', url: 'https://b.com/y', parentId: CHROME_BAR_ID },
+            { id: 'chrome-bm-2', title: 'B dup', url: 'https://b.com/y', parentId: CHROME_BAR_ID }
+          ] }
+        ] }
+      ];
+
+      function makeController(treeSource, seedStore, expectedBarId, validParentIds) {
+        const ffStore = seedStore || {};
+        const calls = { create: [], move: [] };
+        const validParents = {};
+        (validParentIds || []).forEach((id) => { validParents[String(id)] = true; });
+        const controller = trash.createTrashController({
+          bookmarkApi: {
+            getTree: () => {
+              const tree = typeof treeSource === 'function' ? treeSource() : treeSource;
+              return Promise.resolve(JSON.parse(JSON.stringify(tree)));
+            },
+            get: (id) => Promise.resolve({ id: String(id), parentId: 'root', index: 0 }),
+            create: (o) => {
+              const parentId = String(o.parentId);
+              calls.create.push({ parentId: parentId, title: o.title });
+              if (parentId !== expectedBarId) { return Promise.reject(new Error('invalid trash parent: ' + parentId)); }
+              return Promise.resolve({ id: 'new-created', title: o.title, parentId: parentId });
+            },
+            move: (id, o) => {
+              const parentId = String(o.parentId);
+              calls.move.push({ id: String(id), parentId: parentId });
+              if (!validParents[parentId]) { return Promise.reject(new Error('invalid move parent: ' + parentId)); }
+              return Promise.resolve({ id: id, parentId: parentId });
+            }
+          },
+          storageGet: (keys) => {
+            const out = {};
+            (Array.isArray(keys) ? keys : [keys]).forEach((k) => { if (k in ffStore) out[k] = ffStore[k]; });
+            return Promise.resolve(out);
+          },
+          storageSet: (obj) => { Object.keys(obj).forEach((k) => { ffStore[k] = JSON.parse(JSON.stringify(obj[k])); }); return Promise.resolve(); },
+          getNow: () => T_NOW
+        });
+        return { controller: controller, calls: calls };
+      }
+
+      // Test 1: Firefox tree — bulkMove creates trash folder under 'toolbar_____', not '1'.
+      {
+        const ffStore1 = {};
+        ffStore1[constants.KEYS.RECORDS] = [
+          { id: 'ff-bm-1', url: 'https://a.com/x', title: 'A', deletedAt: null, linkStatus: constants.LINK_STATUS_UNCHECKED },
+          { id: 'ff-bm-2', url: 'https://a.com/x', title: 'A dup', deletedAt: null, linkStatus: constants.LINK_STATUS_UNCHECKED }
+        ];
+        ffStore1[constants.KEYS.TRASH_BACKUP_GATE] = { exportedAt: T_NOW };
+        ffStore1[constants.KEYS.TRASH] = [];
+        const test = makeController(ffTree, ffStore1, FF_BAR_ID, [FF_BAR_ID, 'new-created']);
+        const res = await test.controller.bulkMove([{ id: 'ff-bm-2', title: 'A dup', url: 'https://a.com/x', kind: trash.KIND_DUPLICATE }]);
+        check('Firefox bulkMove succeeds (ok:true)', res && res.ok === true, JSON.stringify(res));
+        check('Firefox bulkMove moves bookmark (movedCount > 0)',
+          res && res.ok && typeof res.movedCount === 'number' && res.movedCount > 0,
+          'movedCount=' + (res && res.movedCount));
+        check('Firefox Trash folder creation uses toolbar root',
+          test.calls.create.length === 1 && test.calls.create[0].parentId === FF_BAR_ID,
+          JSON.stringify(test.calls.create));
+      }
+
+      // Test 2: Chrome tree — bulkMove still works with default barId '1'.
+      {
+        const ffStore2 = {};
+        ffStore2[constants.KEYS.RECORDS] = [
+          { id: 'chrome-bm-1', url: 'https://b.com/y', title: 'B', deletedAt: null, linkStatus: constants.LINK_STATUS_UNCHECKED },
+          { id: 'chrome-bm-2', url: 'https://b.com/y', title: 'B dup', deletedAt: null, linkStatus: constants.LINK_STATUS_UNCHECKED }
+        ];
+        ffStore2[constants.KEYS.TRASH_BACKUP_GATE] = { exportedAt: T_NOW };
+        ffStore2[constants.KEYS.TRASH] = [];
+        const test = makeController(chromeTree, ffStore2, CHROME_BAR_ID, [CHROME_BAR_ID, 'new-created']);
+        const res2 = await test.controller.bulkMove([{ id: 'chrome-bm-2', title: 'B dup', url: 'https://b.com/y', kind: trash.KIND_DUPLICATE }]);
+        check('Chrome bulkMove succeeds (ok:true)', res2 && res2.ok === true, JSON.stringify(res2));
+        check('Chrome bulkMove moves bookmark (movedCount > 0)',
+          res2 && res2.ok && typeof res2.movedCount === 'number' && res2.movedCount > 0,
+          'movedCount=' + (res2 && res2.movedCount));
+        check('Chrome Trash folder creation uses bar root',
+          test.calls.create.length === 1 && test.calls.create[0].parentId === CHROME_BAR_ID,
+          JSON.stringify(test.calls.create));
+      }
+
+      // Test 3: Firefox tree — restoreSelected uses detected bar id.
+      {
+        const ffStore3 = {};
+        ffStore3[constants.KEYS.TRASH] = [
+          { id: 'ff-bm-1', title: 'A', url: 'https://a.com/x', kind: trash.KIND_DUPLICATE,
+            originalParentId: 'ff-folder-1', movedAt: T_NOW }
+        ];
+        ffStore3[constants.KEYS.RECORDS] = [
+          { id: 'ff-bm-1', url: 'https://a.com/x', title: 'A', deletedAt: T_NOW, linkStatus: constants.LINK_STATUS_UNCHECKED }
+        ];
+        const test = makeController(ffTree, ffStore3, FF_BAR_ID, ['ff-folder-1']);
+        const res3 = await test.controller.restoreSelected(['ff-bm-1']);
+        check('Firefox restoreSelected succeeds', res3 && res3.ok === true && res3.restoredCount === 1,
+          JSON.stringify(res3));
+      }
+
+      // Test 4: Firefox tree — restoreSelected with missing original parent
+      // falls back to detected bar id (toolbar_____), not hardcoded '1'.
+      {
+        const ffStore4 = {};
+        ffStore4[constants.KEYS.TRASH] = [
+          { id: 'ff-bm-1', title: 'A', url: 'https://a.com/x', kind: trash.KIND_DUPLICATE,
+            originalParentId: 'nonexistent-folder', movedAt: T_NOW }
+        ];
+        ffStore4[constants.KEYS.RECORDS] = [
+          { id: 'ff-bm-1', url: 'https://a.com/x', title: 'A', deletedAt: T_NOW, linkStatus: constants.LINK_STATUS_UNCHECKED }
+        ];
+        const test = makeController(ffTree, ffStore4, FF_BAR_ID, [FF_BAR_ID]);
+        const res4 = await test.controller.restoreSelected(['ff-bm-1']);
+        check('Firefox restoreSelected with missing original parent succeeds (fallback to bar)',
+          res4 && res4.ok === true && res4.restoredCount === 1,
+          JSON.stringify(res4));
+        check('Firefox missing-parent restore fallback uses toolbar root',
+          test.calls.move.length === 1 && test.calls.move[0].parentId === FF_BAR_ID,
+          JSON.stringify(test.calls.move));
+      }
+
+      // Test 5: Chrome restore fallback continues to use the default bar id.
+      {
+        const store = {};
+        store[constants.KEYS.TRASH] = [
+          { id: 'chrome-bm-1', title: 'B', url: 'https://b.com/y', kind: trash.KIND_DUPLICATE,
+            originalParentId: 'nonexistent-folder', movedAt: T_NOW }
+        ];
+        store[constants.KEYS.RECORDS] = [
+          { id: 'chrome-bm-1', url: 'https://b.com/y', title: 'B', deletedAt: T_NOW, linkStatus: constants.LINK_STATUS_UNCHECKED }
+        ];
+        const test = makeController(chromeTree, store, CHROME_BAR_ID, [CHROME_BAR_ID]);
+        const res = await test.controller.restoreSelected(['chrome-bm-1']);
+        check('Chrome restoreSelected with missing original parent succeeds (fallback to bar)',
+          res && res.ok === true && res.restoredCount === 1,
+          JSON.stringify(res));
+        check('Chrome missing-parent restore fallback uses bar root',
+          test.calls.move.length === 1 && test.calls.move[0].parentId === CHROME_BAR_ID,
+          JSON.stringify(test.calls.move));
+      }
+
+      // Test 6: empty and malformed trees must not lock resolution before a
+      // later valid tree exposes the Firefox toolbar root.
+      {
+        const store = {};
+        store[constants.KEYS.RECORDS] = [
+          { id: 'ff-bm-1', url: 'https://a.com/x', title: 'A', deletedAt: null, linkStatus: constants.LINK_STATUS_UNCHECKED },
+          { id: 'ff-bm-2', url: 'https://a.com/x', title: 'A dup', deletedAt: null, linkStatus: constants.LINK_STATUS_UNCHECKED }
+        ];
+        store[constants.KEYS.TRASH_BACKUP_GATE] = { exportedAt: T_NOW };
+        store[constants.KEYS.TRASH] = [];
+        const trees = [[], [{ id: FF_ROOT_ID, children: [{}] }], ffTree];
+        const test = makeController(() => trees.shift(), store, FF_BAR_ID, [FF_BAR_ID, 'new-created']);
+        await test.controller.restoreSelected([]);
+        await test.controller.restoreSelected([]);
+        const res = await test.controller.bulkMove([{ id: 'ff-bm-2' }]);
+        check('Firefox root resolution retries after empty or malformed tree',
+          res && res.ok === true && res.movedCount === 1,
+          JSON.stringify(res));
+        check('Firefox retry creates Trash folder under toolbar root',
+          test.calls.create.length === 1 && test.calls.create[0].parentId === FF_BAR_ID,
+          JSON.stringify(test.calls.create));
+      }
+
+      console.log('[trash] Firefox-compatible bar id tests complete');
+    })();
+  }).then(() => {
     console.log('\nUnit results: ' + (failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'));
     process.exitCode = failures === 0 ? 0 : 1;
   });

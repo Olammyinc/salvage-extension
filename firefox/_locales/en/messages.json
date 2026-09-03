@@ -1,0 +1,14 @@
+{
+  "extensionName": {
+    "message": "Salvage",
+    "description": "Short product name used in the extension UI and interpolated into report copy."
+  },
+  "extensionListingTitle": {
+    "message": "Salvage — Clean Up Duplicate & Broken Bookmarks",
+    "description": "Listing title shown in the browser extension store. The manifest name field references this via __MSG_extensionListingTitle__."
+  },
+  "extensionDescription": {
+    "message": "Find the duplicates, dead links and forgotten folders in the bookmark library you already have. Nothing is deleted without your say-so, and everything is recoverable.",
+    "description": "User-visible description shown on the extension store and management surface."
+  }
+}

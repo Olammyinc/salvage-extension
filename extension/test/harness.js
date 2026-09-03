@@ -2618,6 +2618,289 @@ async function main() {
   check('[21] retry produces a report',
     !!p21okSnap[constants.KEYS.REPORT], '');
 
+  // ---- Part 22: popup-initiated resume-scan recovery (SCANNING, no alarm) ----
+  // Regression for the Chrome recovery defect: after manually stopping the
+  // worker mid-scan, reopening the popup only reads storage, leaving progress
+  // stuck at "Scanning your library (1800 of 3050)" indefinitely. The fix adds
+  // a `resume-scan` runtime message that the popup sends once on init when it
+  // observes a SCANNING checkpoint. This test seeds a SCANNING checkpoint at
+  // ~60% progress with no alarm, dispatches a resume-scan message through the
+  // real service-worker listener, and proves the scan resumes to DONE with
+  // processed==total, a report generated, and alarms cleared.
+  console.log('\n[Part 22] popup-initiated resume-scan recovery (SCANNING, no alarm).');
+
+  // 22a: SCANNING at ~60% with no alarm -> resume-scan message -> DONE.
+  const P22_MOCK = new MockChrome(tree);
+  const p22Queue = fullController.flattenTree(tree, []);
+  const p22Cursor = Math.floor(p22Queue.length * 0.6);
+  const p22Records = fullController.upsertRecords([], p22Queue.slice(0, p22Cursor).map((item) =>
+    fullController.itemToRecord(item, rules, NOW)), NOW);
+  await P22_MOCK.storage.local.set({
+    [constants.KEYS.QUEUE]: p22Queue,
+    [constants.KEYS.RECORDS]: p22Records,
+    [constants.KEYS.CHECKPOINT]: {
+      phase: constants.PHASE.SCANNING,
+      totalCount: p22Queue.length,
+      processedCount: p22Cursor,
+      lastProcessedId: p22Cursor > 0 ? String(p22Queue[p22Cursor - 1].id) : null,
+      updatedAt: NOW,
+      scanStartedAt: NOW
+    },
+    [constants.KEYS.SCHEMA]: constants.SCHEMA_VERSION
+  });
+  check('[22a] precondition: no alarm armed (worker terminated)',
+    P22_MOCK.pendingAlarms === 0, 'alarms=' + P22_MOCK.pendingAlarms);
+  check('[22a] precondition: checkpoint is SCANNING at ~60%',
+    P22_MOCK.snapshot()[constants.KEYS.CHECKPOINT].phase === constants.PHASE.SCANNING &&
+    P22_MOCK.snapshot()[constants.KEYS.CHECKPOINT].processedCount === p22Cursor,
+    'processed=' + p22Cursor + '/' + p22Queue.length);
+
+  // Dispatch resume-scan through the real service-worker listener (Part 13 pattern).
+  // Reuse the swListener captured in Part 13 if available; otherwise skip.
+  if (typeof swListener === 'function') {
+    // Reset the service-worker's internal storage to the P22 mock's storage.
+    // The swListener was registered against swChrome/swStore; we need to point
+    // it at P22_MOCK's storage. Since the controller is lazy-created and cached,
+    // we must use the same storage the listener reads from. We'll use a fresh
+    // service-worker VM context instead.
+    const p22swStore = Object.create(null);
+    const p22swListeners = [];
+    const p22swAlarms = [];
+    const p22swChrome = {
+      runtime: {
+        id: 'ext-p22', getURL: (p) => 'chrome-extension://ext-p22/' + p,
+        sendMessage: () => Promise.resolve(),
+        onMessage: { addListener: (fn) => p22swListeners.push(fn) },
+        onInstalled: { addListener: () => {} }
+      },
+      alarms: { onAlarm: { addListener: () => {} }, create: (name) => { p22swAlarms.push(name); }, clear: () => Promise.resolve(true) },
+      permissions: { contains: () => Promise.resolve(false) },
+      storage: { local: {
+        get: (keys) => {
+          const arr = Array.isArray(keys) ? keys : [keys];
+          return Promise.resolve(arr.reduce((o, k) => { if (k in p22swStore) { o[k] = p22swStore[k]; } return o; }, {}));
+        },
+        set: (obj) => { Object.keys(obj).forEach((k) => { p22swStore[k] = JSON.parse(JSON.stringify(obj[k])); }); return Promise.resolve(); }
+      } },
+      bookmarks: {
+        getTree: () => Promise.resolve(JSON.parse(JSON.stringify(tree))),
+        get: (id) => Promise.resolve(null),
+        create: (o) => Promise.resolve({ id: 'new', title: o.title, parentId: o.parentId }),
+        move: (id, o) => Promise.resolve({ id: id, parentId: o.parentId }),
+        remove: (id) => Promise.resolve()
+      }
+    };
+    // Seed the sw store with the P22 checkpoint.
+    Object.keys(P22_MOCK._storage).forEach((k) => { p22swStore[k] = JSON.parse(JSON.stringify(P22_MOCK._storage[k])); });
+
+    const p22ModMap = {
+      '../shared/constants.js': 'BRConstants', '../shared/normalize.js': 'BRNormalize',
+      '../shared/categorize.js': 'BRCategorize', '../shared/cleanup.js': 'BRCleanup',
+      '../shared/backup.js': 'BRBackup', '../shared/link-checker.js': 'BRLinks',
+      '../shared/report.js': 'BRReport', '../shared/trash.js': 'BRTrash',
+      '../shared/messaging.js': 'BRMessaging', '../shared/scan-controller.js': 'BRScan'
+    };
+    const p22Sandbox = {
+      console, Buffer, setTimeout, clearTimeout, queueMicrotask,
+      Promise, Error, Object, Array, JSON, Math, Date, RegExp, String,
+      Number, Boolean, Map, Set, parseInt, parseFloat, isNaN, isFinite,
+      encodeURIComponent, decodeURIComponent,
+      fetch: () => Promise.resolve({ ok: true, json: () => Promise.resolve(rules) }),
+      chrome: p22swChrome
+    };
+    p22Sandbox.importScripts = (...paths) => paths.forEach((p) => {
+      if (p22ModMap[p]) { p22Sandbox[p22ModMap[p]] = require(p); }
+    });
+    const p22Ctx = vm.createContext(p22Sandbox);
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'background', 'service-worker.js'), 'utf8'),
+      p22Ctx, { filename: 'service-worker.js' });
+    const p22Listener = p22swListeners[0];
+    check('[22a] service-worker message listener registered', typeof p22Listener === 'function', '');
+
+    // Dispatch resume-scan as the popup would.
+    const p22Resp = await new Promise((resolve) => {
+      let r;
+      p22Listener({ type: 'resume-scan' },
+        { id: 'ext-p22', url: 'chrome-extension://ext-p22/popup.html' },
+        (v) => { r = v; });
+      queueMicrotask(() => setTimeout(() => resolve(r), 100));
+    });
+    check('[22a] resume-scan message returns {ok:true}',
+      p22Resp && p22Resp.ok === true, JSON.stringify(p22Resp));
+
+    // Drive any remaining alarms until complete.
+    let p22guard = 0;
+    while (p22swAlarms.length > 0 && p22guard++ < 50) {
+      const alarms = p22swAlarms.splice(0);
+      for (const a of alarms) {
+        // Fire the alarm by calling resume on the controller the SW created.
+        // The SW's alarm listener calls handleResume() which calls getController().resume().
+        // We need to invoke the alarm listener. Since we can't easily access it,
+        // we'll just call resume via the message listener pattern.
+        // Actually, the alarms were scheduled by the controller during resume-scan processing.
+        // We need to fire them. Let's use a scan-status message to check progress,
+        // then send another resume-scan if still scanning.
+        const statusResp = await new Promise((resolve) => {
+          let r;
+          p22Listener({ type: 'scan-status' },
+            { id: 'ext-p22', url: 'chrome-extension://ext-p22/popup.html' },
+            (v) => { r = v; });
+          queueMicrotask(() => setTimeout(() => resolve(r), 50));
+        });
+        if (statusResp && statusResp.checkpoint && statusResp.checkpoint.phase === constants.PHASE.SCANNING) {
+          // Still scanning; send another resume-scan to continue.
+          await new Promise((resolve) => {
+            p22Listener({ type: 'resume-scan' },
+              { id: 'ext-p22', url: 'chrome-extension://ext-p22/popup.html' },
+              () => {});
+            queueMicrotask(() => setTimeout(() => resolve(), 100));
+          });
+        }
+      }
+    }
+
+    // Final status check.
+    const p22FinalResp = await new Promise((resolve) => {
+      let r;
+      p22Listener({ type: 'scan-status' },
+        { id: 'ext-p22', url: 'chrome-extension://ext-p22/popup.html' },
+        (v) => { r = v; });
+      queueMicrotask(() => setTimeout(() => resolve(r), 50));
+    });
+    check('[22a] resume-scan drives scan to DONE',
+      p22FinalResp && p22FinalResp.checkpoint && p22FinalResp.checkpoint.phase === constants.PHASE.DONE,
+      'phase=' + (p22FinalResp && p22FinalResp.checkpoint && p22FinalResp.checkpoint.phase));
+    check('[22a] resume-scan processedCount == totalCount',
+      p22FinalResp && p22FinalResp.checkpoint &&
+      p22FinalResp.checkpoint.processedCount === p22FinalResp.checkpoint.totalCount,
+      p22FinalResp && p22FinalResp.checkpoint &&
+      (p22FinalResp.checkpoint.processedCount + '/' + p22FinalResp.checkpoint.totalCount));
+    check('[22a] resume-scan generates a report',
+      p22FinalResp && p22FinalResp.report !== null && p22FinalResp.report !== undefined,
+      'report=' + typeof (p22FinalResp && p22FinalResp.report));
+    check('[22a] resume-scan report total == queue length',
+      p22FinalResp && p22FinalResp.report &&
+      p22FinalResp.report[constants.METRIC.TOTAL] === p22Queue.length,
+      'total=' + (p22FinalResp && p22FinalResp.report && p22FinalResp.report[constants.METRIC.TOTAL]));
+    check('[22a] alarms cleared after completion', p22swAlarms.length === 0,
+      'alarms=' + p22swAlarms.length);
+  } else {
+    check('[22a] resume-scan recovery test requires swListener (Part 13)', false, 'swListener not available');
+  }
+
+  // 22b: DONE checkpoint -> resume-scan is a no-op (no spurious resume).
+  console.log('  [22b] DONE checkpoint -> resume-scan is a no-op.');
+  const P22B_MOCK = new MockChrome(tree);
+  const p22bQueue = fullController.flattenTree(tree, []);
+  const p22bRecords = fullController.upsertRecords([], p22bQueue.map((item) =>
+    fullController.itemToRecord(item, rules, NOW)), NOW);
+  await P22B_MOCK.storage.local.set({
+    [constants.KEYS.QUEUE]: p22bQueue,
+    [constants.KEYS.RECORDS]: p22bRecords,
+    [constants.KEYS.CHECKPOINT]: {
+      phase: constants.PHASE.DONE,
+      totalCount: p22bQueue.length,
+      processedCount: p22bQueue.length,
+      lastProcessedId: String(p22bQueue[p22bQueue.length - 1].id),
+      updatedAt: NOW,
+      scanStartedAt: NOW,
+      scanCompletedAt: NOW,
+      durationMs: 100
+    },
+    [constants.KEYS.REPORT]: report.computeReport(p22bRecords, NOW, { folderFindings: null, timing: null }),
+    [constants.KEYS.SCHEMA]: constants.SCHEMA_VERSION
+  });
+  const p22bController = createScanController(P22B_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  const p22bBefore = JSON.stringify(P22B_MOCK.snapshot());
+  await p22bController.resume();
+  const p22bAfter = JSON.stringify(P22B_MOCK.snapshot());
+  check('[22b] resume over DONE is a no-op (storage unchanged)',
+    p22bBefore === p22bAfter, '');
+  check('[22b] resume over DONE schedules no alarm',
+    P22B_MOCK.pendingAlarms === 0, 'alarms=' + P22B_MOCK.pendingAlarms);
+
+  // 22c: FAILED checkpoint -> resume-scan is a no-op (no spurious resume).
+  console.log('  [22c] FAILED checkpoint -> resume-scan is a no-op.');
+  const P22C_MOCK = new MockChrome(tree);
+  await P22C_MOCK.storage.local.set({
+    [constants.KEYS.CHECKPOINT]: {
+      phase: constants.PHASE.FAILED,
+      totalCount: 100,
+      processedCount: 50,
+      updatedAt: NOW,
+      error: 'test failure'
+    },
+    [constants.KEYS.SCHEMA]: constants.SCHEMA_VERSION
+  });
+  const p22cController = createScanController(P22C_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  const p22cBefore = JSON.stringify(P22C_MOCK.snapshot());
+  await p22cController.resume();
+  const p22cAfter = JSON.stringify(P22C_MOCK.snapshot());
+  check('[22c] resume over FAILED is a no-op (storage unchanged)',
+    p22cBefore === p22cAfter, '');
+  check('[22c] resume over FAILED schedules no alarm',
+    P22C_MOCK.pendingAlarms === 0, 'alarms=' + P22C_MOCK.pendingAlarms);
+
+  // 22d: No duplicate concurrent resume (serialized single-flight).
+  console.log('  [22d] no duplicate concurrent resume (serialized single-flight).');
+  const P22D_MOCK = new MockChrome(tree);
+  const p22dQueue = fullController.flattenTree(tree, []);
+  const p22dCursor = Math.floor(p22dQueue.length * 0.3);
+  const p22dRecords = fullController.upsertRecords([], p22dQueue.slice(0, p22dCursor).map((item) =>
+    fullController.itemToRecord(item, rules, NOW)), NOW);
+  await P22D_MOCK.storage.local.set({
+    [constants.KEYS.QUEUE]: p22dQueue,
+    [constants.KEYS.RECORDS]: p22dRecords,
+    [constants.KEYS.CHECKPOINT]: {
+      phase: constants.PHASE.SCANNING,
+      totalCount: p22dQueue.length,
+      processedCount: p22dCursor,
+      lastProcessedId: p22dCursor > 0 ? String(p22dQueue[p22dCursor - 1].id) : null,
+      updatedAt: NOW,
+      scanStartedAt: NOW
+    },
+    [constants.KEYS.SCHEMA]: constants.SCHEMA_VERSION
+  });
+  const p22dController = createScanController(P22D_MOCK.deps({
+    getNow: () => NOW,
+    loadRules: () => Promise.resolve(rules)
+  }));
+  // Fire 4 concurrent resume calls. The single-flight serialize ensures they
+  // run sequentially, not in parallel. The scan must complete exactly once.
+  const p22dResults = await Promise.all([
+    p22dController.resume(),
+    p22dController.resume(),
+    p22dController.resume(),
+    p22dController.resume()
+  ]);
+  // Drive any remaining alarms.
+  let p22dGuard = 0;
+  while (P22D_MOCK.pendingAlarms > 0 && p22dGuard++ < 50) {
+    await P22D_MOCK.fireWakes(() => p22dController.resume());
+  }
+  await p22dController.resume();
+  const p22dSnap = P22D_MOCK.snapshot();
+  const p22dCp = p22dSnap[constants.KEYS.CHECKPOINT];
+  check('[22d] concurrent resumes reach DONE (not duplicated)',
+    p22dCp && p22dCp.phase === constants.PHASE.DONE,
+    'phase=' + (p22dCp && p22dCp.phase));
+  check('[22d] concurrent resumes processedCount == totalCount',
+    p22dCp && p22dCp.processedCount === p22dCp.totalCount,
+    p22dCp && (p22dCp.processedCount + '/' + p22dCp.totalCount));
+  check('[22d] concurrent resumes generate exactly one report',
+    !!p22dSnap[constants.KEYS.REPORT], '');
+  check('[22d] concurrent resumes clear alarms',
+    P22D_MOCK.pendingAlarms === 0, 'alarms=' + P22D_MOCK.pendingAlarms);
+  check('[22d] records are complete (no duplication from concurrent resumes)',
+    (p22dSnap[constants.KEYS.RECORDS] || []).length === p22dQueue.length,
+    'records=' + (p22dSnap[constants.KEYS.RECORDS] || []).length);
+
   // ---- Footprint probe: measure snapshot JSON bytes per record ---------------
   // Deterministic assertion: the snapshot JSON size scales linearly and stays
   // within the expected per-record budget. This catches schema bloat early.

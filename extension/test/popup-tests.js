@@ -106,7 +106,11 @@ const chrome = {
       get: (keys, cb) => { const o = {}; (Array.isArray(keys) ? keys : [keys]).forEach((k) => { if (k in store) o[k] = store[k]; }); cb(o); },
       set: (o, cb) => { Object.keys(o).forEach((k) => { store[k] = JSON.parse(JSON.stringify(o[k])); }); if (cb) cb(); }
     },
-    onChanged: { addListener() {} }
+    onChanged: {
+      _listeners: [],
+      addListener(fn) { this._listeners.push(fn); },
+      removeListener(fn) { this._listeners = this._listeners.filter((f) => f !== fn); }
+    }
   },
   runtime: { sendMessage(msg, cb) { const h = messageHandler || defaultMessageHandler; if (cb) setTimeout(() => h(msg, cb), 0); } },
   tabs: { create() {} },
@@ -158,7 +162,10 @@ const records = [
   mkRec('7', 'https://dup.com/p', 'unreachable'),      // duplicate, unreachable
   mkRec('8', 'https://dup.com/p', 'unreachable'),      // duplicate, unreachable
   // a soft-deleted confirmed-dead record must never be offered as selectable
-  mkRec('9', 'https://gone-trash.com/x', 'unreachable', { deletedAt: NOW })
+  mkRec('9', 'https://gone-trash.com/x', 'unreachable', { deletedAt: NOW }),
+  // Extra duplicates to support the "move 4 copies" regression test
+  mkRec('10', 'https://dup.com/p', 'reachable'),       // duplicate, reachable
+  mkRec('11', 'https://dup.com/p', 'reachable')        // duplicate, reachable
 ];
 
 // Helpers over the shim element tree (mirrors real DOM child semantics).
@@ -214,9 +221,9 @@ async function main() {
       emptyFoldersList: [{ path: ['Folder One'], title: 'Folder One' }],
       sameNameMergeList: [{ parentPath: ['Parent'], name: 'Untitled', displayName: 'Untitled', folders: ['1', '2'] }]
     };
-    store[constants.KEYS.LINK_REPORT] = { checked: 8, reachable: 3, unreachable: 4, couldNotCheck: 1, durationMs: 100, ranAt: NOW };
-    store[constants.KEYS.LINK_CHECKPOINT] = { phase: constants.PHASE.DONE, processedCount: 8, totalCount: 8 };
-    store[constants.KEYS.CHECKPOINT] = { phase: constants.PHASE.DONE, totalCount: 8, processedCount: 8, lastProcessedId: '9', updatedAt: NOW };
+    store[constants.KEYS.LINK_REPORT] = { checked: 10, reachable: 5, unreachable: 4, couldNotCheck: 1, durationMs: 100, ranAt: NOW };
+    store[constants.KEYS.LINK_CHECKPOINT] = { phase: constants.PHASE.DONE, processedCount: 10, totalCount: 10 };
+    store[constants.KEYS.CHECKPOINT] = { phase: constants.PHASE.DONE, totalCount: 11, processedCount: 11, lastProcessedId: '11', updatedAt: NOW };
     if (overrides) {
       Object.keys(overrides).forEach((k) => {
         const v = overrides[k];
@@ -236,12 +243,12 @@ async function main() {
   // --- Scenario A: clicking each result total routes to the matching records ----
   reset(); loadPopup(); await settle();
   const linkTotal = { reachable: 0, unreachable: 1, couldNotCheck: 2 };
-  const expected = { reachable: 3, unreachable: 4, couldNotCheck: 1 };
+  const expected = { reachable: 5, unreachable: 4, couldNotCheck: 1 };
 
   clickLinkTotal(linkTotal.reachable);
   check('reachable total opens a list, not an empty/0 view',
     /reachable/.test(els['list-title'].textContent) === false && itemCount() === expected.reachable &&
-    /3 shown/.test(countLineText()), 'count=' + countLineText() + ' items=' + itemCount());
+    new RegExp(expected.reachable + ' shown').test(countLineText()), 'count=' + countLineText() + ' items=' + itemCount());
   check('reachable list shows the matching persisted records', itemCount() === expected.reachable);
 
   reset(); loadPopup(); await settle();
@@ -673,6 +680,248 @@ async function main() {
   check('Q: no storage event needed (stored checkpoint unchanged)',
     store[constants.KEYS.CHECKPOINT] && store[constants.KEYS.CHECKPOINT].phase === constants.PHASE.DONE,
     'storedPhase=' + (store[constants.KEYS.CHECKPOINT] && store[constants.KEYS.CHECKPOINT].phase));
+
+  // --- Scenario R: live duplicate count derives from records, not stale report --
+  // After a durable Trash move, the report's DUPLICATES count is stale (the
+  // report is never regenerated for a bulk move). The visible metric must derive
+  // from the current records via BRCleanup.computeDuplicateGroups, so it drops
+  // after a move and returns after restore/undo.
+  resetSeed();
+  // Compute the initial live duplicate count from records (the expected baseline).
+  const initialLiveDup = cleanup.computeDuplicateGroups(records).totalDuplicates;
+  check('R precondition: initial live duplicate count from records is positive',
+    initialLiveDup > 0, 'liveDup=' + initialLiveDup);
+  loadPopup(); await settle();
+  // The report row for duplicates must show the live count, not the stale report.
+  const dupRow = allOf(els['report'], (c) => c.dataset && c.dataset.key === 'duplicates');
+  const dupLabel = dupRow.length ? dupRow[0].children[0].textContent : '';
+  check('R1: initial duplicate metric shows the live count from records',
+    new RegExp('^' + initialLiveDup + ' exact duplicate').test(dupLabel),
+    'label=' + dupLabel);
+
+  // Simulate moving 4 duplicate copies: mark 4 records as deletedAt in storage,
+  // then reload the popup and verify the count drops by 4.
+  const dupGroups = cleanup.computeDuplicateGroups(records).groups;
+  const allDupCopies = [];
+  dupGroups.forEach((g) => { g.duplicates.forEach((d) => allDupCopies.push(d)); });
+  const movedIds = new Set(allDupCopies.slice(0, 4).map((d) => String(d.id)));
+  const movedRecords = records.map((r) =>
+    movedIds.has(String(r.id)) ? Object.assign({}, r, { deletedAt: NOW }) : r);
+  resetSeed({ [constants.KEYS.RECORDS]: movedRecords });
+  loadPopup(); await settle();
+  const afterMoveDup = cleanup.computeDuplicateGroups(movedRecords).totalDuplicates;
+  check('R2: live duplicate count drops by 4 after moving 4 copies',
+    afterMoveDup === initialLiveDup - 4,
+    'afterMove=' + afterMoveDup + ' expected=' + (initialLiveDup - 4));
+  const dupRowAfter = allOf(els['report'], (c) => c.dataset && c.dataset.key === 'duplicates');
+  const dupLabelAfter = dupRowAfter.length ? dupRowAfter[0].children[0].textContent : '';
+  check('R3: duplicate metric label reflects the reduced count',
+    new RegExp('^' + afterMoveDup + ' exact duplicate').test(dupLabelAfter),
+    'label=' + dupLabelAfter);
+
+  // Simulate restore/undo: clear deletedAt on the moved records, reload, verify
+  // the count returns to the initial value.
+  const restoredRecords = movedRecords.map((r) =>
+    movedIds.has(String(r.id)) ? Object.assign({}, r, { deletedAt: null }) : r);
+  resetSeed({ [constants.KEYS.RECORDS]: restoredRecords });
+  loadPopup(); await settle();
+  const afterRestoreDup = cleanup.computeDuplicateGroups(restoredRecords).totalDuplicates;
+  check('R4: live duplicate count returns after restore/undo',
+    afterRestoreDup === initialLiveDup,
+    'afterRestore=' + afterRestoreDup + ' expected=' + initialLiveDup);
+  const dupRowRestored = allOf(els['report'], (c) => c.dataset && c.dataset.key === 'duplicates');
+  const dupLabelRestored = dupRowRestored.length ? dupRowRestored[0].children[0].textContent : '';
+  check('R5: duplicate metric label reflects the restored count',
+    new RegExp('^' + afterRestoreDup + ' exact duplicate').test(dupLabelRestored),
+    'label=' + dupLabelRestored);
+
+  // --- Scenario S: New Folder CTA says "Review" (not "Sort these") -----------
+  resetSeed(); loadPopup(); await settle();
+  const nfRow = allOf(els['report'], (c) => c.dataset && c.dataset.key === 'newFolder');
+  const nfCta = nfRow.length ? nfRow[0].children[1].textContent : '';
+  check('S1: New Folder CTA says "Review" (not "Sort these")',
+    nfCta === 'Review', 'cta=' + nfCta);
+
+  // --- Scenario T: New Folder review route clears cleanup state ---------------
+  // Navigate from a cleanup-capable list (duplicates) to the New Folder
+  // read-only list. The cleanup action bar must be hidden and no checkboxes
+  // must remain — regression for the stale Move-to-Trash bar.
+  resetSeed(); loadPopup(); await settle();
+  clickReportRow('duplicates'); // opens cleanup-selection list (bar visible)
+  check('T precondition: duplicates list shows the selectable action bar',
+    listCleanupHidden() === false &&
+    allOf(els['list-items'], (c) => c.tagName === 'input').length > 0, '');
+  clickCheckbox(2); // check 2 items so announce/button are nonzero
+  check('T precondition: nonzero announce before New Folder nav',
+    announce() === '2 selected', 'announce=' + announce());
+  clickReportRow('newFolder'); // read-only New Folder list
+  check('T1: duplicates -> newFolder: action bar hidden',
+    listCleanupHidden() === true, 'hidden=' + listCleanupHidden());
+  check('T2: duplicates -> newFolder: no checkboxes remain',
+    allOf(els['list-items'], (c) => c.tagName === 'input').length === 0, '');
+  check('T3: duplicates -> newFolder: selection announce reset to 0',
+    announce() === '0 selected', 'announce=' + announce());
+  check('T4: duplicates -> newFolder: no stale Move action label',
+    /^Move 0 to /.test(btnText()), 'btn=' + btnText());
+
+  // Also verify stale and noRecordedOpening routes clear cleanup state.
+  resetSeed(); loadPopup(); await settle();
+  clickReportRow('duplicates');
+  clickCheckbox(2);
+  clickReportRow('stale');
+  check('T5: duplicates -> stale: action bar hidden',
+    listCleanupHidden() === true &&
+    allOf(els['list-items'], (c) => c.tagName === 'input').length === 0 &&
+    announce() === '0 selected' && /^Move 0 to /.test(btnText()),
+    'hidden=' + listCleanupHidden() + ' announce=' + announce() + ' btn=' + btnText());
+
+  resetSeed(); loadPopup(); await settle();
+  clickReportRow('duplicates');
+  clickCheckbox(2);
+  clickReportRow('noRecordedOpening');
+  check('T6: duplicates -> noRecordedOpening: action bar hidden',
+    listCleanupHidden() === true &&
+    allOf(els['list-items'], (c) => c.tagName === 'input').length === 0 &&
+    announce() === '0 selected' && /^Move 0 to /.test(btnText()),
+    'hidden=' + listCleanupHidden() + ' announce=' + announce() + ' btn=' + btnText());
+
+  // --- Scenario U: SCANNING checkpoint -> popup sends resume-scan on init ----
+  // Regression for the Chrome recovery defect: when the popup opens and observes
+  // a persisted SCANNING checkpoint, it must send a single resume-scan message
+  // to wake the worker. This is throttled to one request per popup lifecycle.
+  const sentMessages = [];
+  const origSendMessage = chrome.runtime.sendMessage;
+  chrome.runtime.sendMessage = function (msg, cb) {
+    sentMessages.push(msg);
+    const h = messageHandler || defaultMessageHandler;
+    if (cb) setTimeout(() => h(msg, cb), 0);
+  };
+
+  resetSeed({
+    [constants.KEYS.CHECKPOINT]: { phase: constants.PHASE.SCANNING, totalCount: 3050, processedCount: 1800, lastProcessedId: '1800', updatedAt: NOW, scanStartedAt: NOW },
+    [constants.KEYS.REPORT]: null,
+    [constants.KEYS.RECORDS]: []
+  });
+  // Clear accumulated storage listeners from earlier popup instances to
+  // simulate a fresh popup lifecycle (real Chrome destroys old popup + GC).
+  chrome.storage.onChanged._listeners.length = 0;
+  sentMessages.length = 0;
+  loadPopup(); await settle();
+  const resumeMsgs = sentMessages.filter((m) => m.type === 'resume-scan');
+  check('U1: SCANNING checkpoint -> popup sends exactly one resume-scan on init',
+    resumeMsgs.length === 1, 'resume-scan count=' + resumeMsgs.length);
+  check('U2: resume-scan message has the correct type',
+    resumeMsgs.length > 0 && resumeMsgs[0].type === 'resume-scan',
+    'type=' + (resumeMsgs.length > 0 ? resumeMsgs[0].type : 'none'));
+
+  // --- Scenario V: DONE checkpoint -> popup does NOT send resume-scan ---------
+  resetSeed({
+    [constants.KEYS.CHECKPOINT]: { phase: constants.PHASE.DONE, totalCount: 3050, processedCount: 3050, lastProcessedId: '3050', updatedAt: NOW }
+  });
+  sentMessages.length = 0;
+  loadPopup(); await settle();
+  const doneResumeMsgs = sentMessages.filter((m) => m.type === 'resume-scan');
+  check('V1: DONE checkpoint -> popup does NOT send resume-scan',
+    doneResumeMsgs.length === 0, 'resume-scan count=' + doneResumeMsgs.length);
+
+  // --- Scenario W: FAILED checkpoint -> popup does NOT send resume-scan -------
+  resetSeed({
+    [constants.KEYS.CHECKPOINT]: { phase: constants.PHASE.FAILED, totalCount: 100, processedCount: 50, updatedAt: NOW, error: 'test' },
+    [constants.KEYS.REPORT]: null,
+    [constants.KEYS.RECORDS]: []
+  });
+  sentMessages.length = 0;
+  loadPopup(); await settle();
+  const failedResumeMsgs = sentMessages.filter((m) => m.type === 'resume-scan');
+  check('W1: FAILED checkpoint -> popup does NOT send resume-scan',
+    failedResumeMsgs.length === 0, 'resume-scan count=' + failedResumeMsgs.length);
+
+  // --- Scenario X: resume-scan sent only once per popup lifecycle -------------
+  // Even if storage changes (scan progressing), the popup must NOT send another
+  // resume-scan. Exactly one send per popup open — the one-shot flag is never
+  // reset while the popup lives.
+  resetSeed({
+    [constants.KEYS.CHECKPOINT]: { phase: constants.PHASE.SCANNING, totalCount: 3050, processedCount: 1800, lastProcessedId: '1800', updatedAt: NOW, scanStartedAt: NOW },
+    [constants.KEYS.REPORT]: null,
+    [constants.KEYS.RECORDS]: []
+  });
+  // Clear accumulated storage listeners from earlier popup instances to
+  // simulate a fresh popup lifecycle (real Chrome destroys old popup + GC).
+  chrome.storage.onChanged._listeners.length = 0;
+  sentMessages.length = 0;
+  loadPopup(); await settle();
+  const firstCount = sentMessages.filter((m) => m.type === 'resume-scan').length;
+  check('X0: popup sends exactly one resume-scan on init',
+    firstCount === 1, 'resume-scan count=' + firstCount);
+  // Simulate a real storage change event (scan progressing to 1900). The
+  // shim now retains and invokes storage.onChanged listeners, so this fires
+  // the popup's onStorageChanged -> refreshFromStorage -> sendResumeScan path.
+  const prevCheckpoint = store[constants.KEYS.CHECKPOINT];
+  store[constants.KEYS.CHECKPOINT] = { phase: constants.PHASE.SCANNING, totalCount: 3050, processedCount: 1900, lastProcessedId: '1900', updatedAt: NOW, scanStartedAt: NOW };
+  const changes = {};
+  changes[constants.KEYS.CHECKPOINT] = { oldValue: prevCheckpoint, newValue: store[constants.KEYS.CHECKPOINT] };
+  chrome.storage.onChanged._listeners.forEach((fn) => fn(changes, 'local'));
+  await settle();
+  const totalCount = sentMessages.filter((m) => m.type === 'resume-scan').length;
+  check('X1: real storage change during SCANNING does NOT send a duplicate resume-scan',
+    totalCount === 1, 'total resume-scan count=' + totalCount);
+  // Simulate a second storage change (progress to 2000) — still no duplicate.
+  store[constants.KEYS.CHECKPOINT] = { phase: constants.PHASE.SCANNING, totalCount: 3050, processedCount: 2000, lastProcessedId: '2000', updatedAt: NOW, scanStartedAt: NOW };
+  const changes2 = {};
+  changes2[constants.KEYS.CHECKPOINT] = { oldValue: { processedCount: 1900 }, newValue: store[constants.KEYS.CHECKPOINT] };
+  chrome.storage.onChanged._listeners.forEach((fn) => fn(changes2, 'local'));
+  await settle();
+  const afterSecond = sentMessages.filter((m) => m.type === 'resume-scan').length;
+  check('X2: second storage change still does NOT send a duplicate (one-shot)',
+    afterSecond === 1, 'total resume-scan count=' + afterSecond);
+
+  // --- Scenario Y: new popup lifecycle sends resume-scan again ----------------
+  // A new popup lifecycle (reopen) with a SCANNING checkpoint should send
+  // resume-scan — the one-shot flag is per-popup, not global.
+  resetSeed({
+    [constants.KEYS.CHECKPOINT]: { phase: constants.PHASE.SCANNING, totalCount: 3050, processedCount: 2000, lastProcessedId: '2000', updatedAt: NOW, scanStartedAt: NOW },
+    [constants.KEYS.REPORT]: null,
+    [constants.KEYS.RECORDS]: []
+  });
+  // Clear accumulated storage listeners from earlier popup instances.
+  chrome.storage.onChanged._listeners.length = 0;
+  sentMessages.length = 0;
+  loadPopup(); await settle();
+  const newCursorMsgs = sentMessages.filter((m) => m.type === 'resume-scan');
+  check('Y1: new popup lifecycle with SCANNING checkpoint sends resume-scan',
+    newCursorMsgs.length === 1, 'resume-scan count=' + newCursorMsgs.length);
+
+  // --- Scenario Z: buildList('stale') with null report renders empty ---------
+  // After a rescan starts, snapshot.report is null (dropped at scan start). If
+  // the user had a stale list open and a storage change fires, buildList must
+  // not throw on snapshot.report[GENERATED_AT]. It should safely render empty.
+  resetSeed({
+    [constants.KEYS.CHECKPOINT]: { phase: constants.PHASE.DONE, totalCount: 11, processedCount: 11, updatedAt: NOW },
+    // Keep default valid report so the stale row is rendered; records carry linkStatuses.
+    [constants.KEYS.RECORDS]: records
+  });
+  // Clear accumulated storage listeners from earlier popup instances.
+  chrome.storage.onChanged._listeners.length = 0;
+  loadPopup(); await settle();
+  // Simulate a rescan starting: the report is dropped from storage.
+  store[constants.KEYS.REPORT] = null;
+  // Fire storage change event so refreshFromStorage picks up the null report.
+  chrome.storage.onChanged._listeners.forEach((fn) => fn(
+    { [constants.KEYS.REPORT]: { oldValue: store[constants.KEYS.REPORT], newValue: null } }, 'local'));
+  await settle();
+  // The stale row still exists in the DOM from the initial render. Click it —
+  // openList -> buildList must not throw on snapshot.report[GENERATED_AT].
+  let staleThrew = false;
+  try { clickReportRow('stale'); } catch (e) { staleThrew = true; }
+  check('Z1: buildList(stale) with null report does not throw',
+    staleThrew === false, staleThrew ? 'threw' : '');
+  check('Z2: stale list with null report renders 0 items (empty/read-only)',
+    itemCount() === 0, 'items=' + itemCount());
+  check('Z3: stale list with null report shows "0 shown"',
+    /0 shown/.test(countLineText()), 'count=' + countLineText());
+
+  // Restore original sendMessage.
+  chrome.runtime.sendMessage = origSendMessage;
 
   console.log('\nPopup results: ' + (failures === 0 ? 'ALL PASS' : failures + ' FAILURE(S)'));
   process.exitCode = failures === 0 ? 0 : 1;

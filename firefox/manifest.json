@@ -15,7 +15,19 @@
     "<all_urls>"
   ],
   "background": {
-    "service_worker": "background/service-worker.js"
+    "scripts": [
+      "shared/constants.js",
+      "shared/normalize.js",
+      "shared/categorize.js",
+      "shared/cleanup.js",
+      "shared/backup.js",
+      "shared/link-checker.js",
+      "shared/report.js",
+      "shared/trash.js",
+      "shared/messaging.js",
+      "shared/scan-controller.js",
+      "background/service-worker.js"
+    ]
   },
   "action": {
     "default_popup": "ui/popup.html",

@@ -1,15 +1,24 @@
 /**
- * Firefox 121+ background.scripts tests (no Chrome).
+ * Firefox separate-package tests.
  *
  * Validates:
- *   1. manifest.json declares background.scripts with the exact ordered list
- *      of shared modules followed by the service-worker entrypoint;
- *   2. the service-worker entrypoint guards importScripts so it does not
+ *   1. Chrome manifest (extension/) has NO background.scripts — only
+ *      background.service_worker.
+ *   2. Firefox manifest (firefox/) declares background.scripts with the exact
+ *      ordered list of shared modules followed by the service-worker
+ *      entrypoint; has NO background.service_worker; has NO gecko_id / AMO
+ *      config.
+ *   3. Every runtime file referenced by the Firefox manifest and popup exists
+ *      on disk under firefox/.
+ *   4. The service-worker entrypoint guards importScripts so it does not
  *      re-import when globals are already present (Firefox classic-script
- *      loading path);
- *   3. simulating the Firefox classic-script load order (shared modules first,
+ *      loading path).
+ *   5. Simulating the Firefox classic-script load order (shared modules first,
  *      then the entrypoint) registers the expected listeners and handles a
  *      scan-now request through MockChrome.
+ *   6. Deterministic mirror-sync: every runtime file in firefox/ that is NOT
+ *      the manifest must be byte-identical to its extension/ counterpart.
+ *      Only the manifest background key difference is permitted.
  *
  * Run: node test/firefox-tests.js
  */
@@ -46,11 +55,26 @@ function trackAsync() {
   };
 }
 
-const root = path.join(__dirname, '..');
-const manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8'));
+const extensionRoot = path.join(__dirname, '..');
+const firefoxRoot = path.join(extensionRoot, '..', 'firefox');
 
-// ---- Part 1: manifest background.scripts declaration -----------------------
-console.log('[Part 1] manifest background.scripts');
+// ---- Part 1: Chrome manifest rejects background.scripts --------------------
+console.log('[Part 1] Chrome manifest has no background.scripts');
+
+const chromeManifest = JSON.parse(fs.readFileSync(path.join(extensionRoot, 'manifest.json'), 'utf8'));
+
+check('Chrome manifest has background.service_worker',
+  chromeManifest.background && chromeManifest.background.service_worker === 'background/service-worker.js',
+  'got=' + (chromeManifest.background && chromeManifest.background.service_worker));
+
+check('Chrome manifest has NO background.scripts',
+  !chromeManifest.background || !Array.isArray(chromeManifest.background.scripts),
+  'got=' + typeof (chromeManifest.background && chromeManifest.background.scripts));
+
+// ---- Part 2: Firefox manifest background.scripts declaration ---------------
+console.log('[Part 2] Firefox manifest background.scripts');
+
+const firefoxManifest = JSON.parse(fs.readFileSync(path.join(firefoxRoot, 'manifest.json'), 'utf8'));
 
 const expectedScripts = [
   'shared/constants.js',
@@ -66,33 +90,88 @@ const expectedScripts = [
   'background/service-worker.js'
 ];
 
-check('manifest has background.scripts array',
-  Array.isArray(manifest.background && manifest.background.scripts),
-  'type=' + typeof (manifest.background && manifest.background.scripts));
+check('Firefox manifest has background.scripts array',
+  Array.isArray(firefoxManifest.background && firefoxManifest.background.scripts),
+  'type=' + typeof (firefoxManifest.background && firefoxManifest.background.scripts));
 
-check('background.scripts length matches expected (' + expectedScripts.length + ')',
-  manifest.background.scripts && manifest.background.scripts.length === expectedScripts.length,
-  'got=' + (manifest.background.scripts && manifest.background.scripts.length));
+check('Firefox background.scripts length matches expected (' + expectedScripts.length + ')',
+  firefoxManifest.background.scripts && firefoxManifest.background.scripts.length === expectedScripts.length,
+  'got=' + (firefoxManifest.background.scripts && firefoxManifest.background.scripts.length));
 
-check('background.service_worker is still present for Chromium',
-  manifest.background && manifest.background.service_worker === 'background/service-worker.js',
-  'got=' + (manifest.background && manifest.background.service_worker));
+check('Firefox manifest has NO background.service_worker',
+  !firefoxManifest.background || firefoxManifest.background.service_worker === undefined,
+  'got=' + (firefoxManifest.background && firefoxManifest.background.service_worker));
+
+check('Firefox manifest has NO persistent flag',
+  !firefoxManifest.background || firefoxManifest.background.persistent === undefined,
+  'got=' + (firefoxManifest.background && firefoxManifest.background.persistent));
+
+check('Firefox manifest has NO browser_specific_settings.gecko',
+  !firefoxManifest.browser_specific_settings || !firefoxManifest.browser_specific_settings.gecko,
+  'found gecko config');
 
 for (let i = 0; i < expectedScripts.length; i++) {
   check('background.scripts[' + i + '] === ' + expectedScripts[i],
-    manifest.background.scripts[i] === expectedScripts[i],
-    'got=' + JSON.stringify(manifest.background.scripts[i]));
+    firefoxManifest.background.scripts[i] === expectedScripts[i],
+    'got=' + JSON.stringify(firefoxManifest.background.scripts[i]));
 }
 
-// Verify every file in the scripts array actually exists on disk.
-for (const rel of manifest.background.scripts) {
-  check('file exists: ' + rel, fs.existsSync(path.join(root, rel)), '');
+// Verify shared fields match Chrome.
+check('Firefox version matches Chrome', firefoxManifest.version === chromeManifest.version,
+  'firefox=' + firefoxManifest.version + ' chrome=' + chromeManifest.version);
+check('Firefox name matches Chrome', firefoxManifest.name === chromeManifest.name,
+  'firefox=' + firefoxManifest.name + ' chrome=' + chromeManifest.name);
+check('Firefox permissions match Chrome',
+  JSON.stringify(firefoxManifest.permissions) === JSON.stringify(chromeManifest.permissions),
+  '');
+check('Firefox icons match Chrome',
+  JSON.stringify(firefoxManifest.icons) === JSON.stringify(chromeManifest.icons),
+  '');
+check('Firefox action.default_popup matches Chrome',
+  firefoxManifest.action && firefoxManifest.action.default_popup === (chromeManifest.action && chromeManifest.action.default_popup),
+  '');
+
+// ---- Part 3: Firefox runtime file existence --------------------------------
+console.log('[Part 3] Firefox runtime file existence');
+
+// Every script in background.scripts must exist.
+for (const rel of firefoxManifest.background.scripts) {
+  check('firefox file exists: ' + rel, fs.existsSync(path.join(firefoxRoot, rel)), '');
 }
 
-// ---- Part 2: importScripts guard in service-worker.js ----------------------
-console.log('[Part 2] importScripts guard');
+// Popup files must exist.
+const popupHtml = firefoxManifest.action && firefoxManifest.action.default_popup;
+if (popupHtml) {
+  check('firefox popup exists: ' + popupHtml, fs.existsSync(path.join(firefoxRoot, popupHtml)), '');
+  // Parse popup HTML for script src references and verify they exist.
+  const popupSrc = fs.readFileSync(path.join(firefoxRoot, popupHtml), 'utf8');
+  const scriptSrcRe = /<script[^>]+src=["']([^"']+)["']/g;
+  let m;
+  while ((m = scriptSrcRe.exec(popupSrc)) !== null) {
+    const scriptRel = m[1];
+    check('firefox popup script exists: ' + scriptRel, fs.existsSync(path.join(firefoxRoot, scriptRel)), '');
+  }
+}
 
-const swSource = fs.readFileSync(path.join(root, 'background', 'service-worker.js'), 'utf8');
+// rules-data.json must exist (loaded at runtime via fetch).
+check('firefox shared/rules-data.json exists',
+  fs.existsSync(path.join(firefoxRoot, 'shared', 'rules-data.json')), '');
+
+// _locales must exist.
+check('firefox _locales/en/messages.json exists',
+  fs.existsSync(path.join(firefoxRoot, '_locales', 'en', 'messages.json')), '');
+
+// Assets referenced by icons must exist.
+const iconSizes = Object.keys(firefoxManifest.icons || {});
+for (const size of iconSizes) {
+  const iconPath = firefoxManifest.icons[size];
+  check('firefox icon exists: ' + iconPath, fs.existsSync(path.join(firefoxRoot, iconPath)), '');
+}
+
+// ---- Part 4: importScripts guard in service-worker.js ----------------------
+console.log('[Part 4] importScripts guard');
+
+const swSource = fs.readFileSync(path.join(firefoxRoot, 'background', 'service-worker.js'), 'utf8');
 check('service-worker.js contains typeof BRConstants guard',
   /typeof\s+BRConstants\s*===\s*['"]undefined['"]/.test(swSource),
   '');
@@ -100,19 +179,13 @@ check('service-worker.js still has importScripts call inside the guard',
   /importScripts\(/.test(swSource),
   '');
 
-// ---- Part 3: simulated Firefox classic-script loading ----------------------
-// In Firefox, background.scripts loads each file as a classic script in order.
-// The shared modules set globals (BRConstants, BRScan, etc.) on self/globalThis.
-// Then service-worker.js runs and sees those globals, skipping importScripts.
-// We simulate this by evaluating each shared module in a vm.Context that
-// accumulates globals, then evaluating the entrypoint and verifying listeners.
-console.log('[Part 3] simulated Firefox classic-script loading');
+// ---- Part 5: simulated Firefox classic-script loading ----------------------
+console.log('[Part 5] simulated Firefox classic-script loading');
 
-// Build a sandbox that mimics the Firefox background-script global scope.
 const listeners = { alarms: [], installed: [], message: [] };
 const sandbox = {
-  self: undefined, // filled below
-  globalThis: undefined, // filled below
+  self: undefined,
+  globalThis: undefined,
   console: console,
   setTimeout: setTimeout,
   clearTimeout: clearTimeout,
@@ -146,7 +219,6 @@ const sandbox = {
 sandbox.self = sandbox;
 sandbox.globalThis = sandbox;
 
-// Mock chrome APIs for the entrypoint.
 const mockStorage = {};
 sandbox.chrome = {
   bookmarks: {
@@ -203,7 +275,7 @@ const ctx = vm.createContext(sandbox);
 // Load shared modules in order (simulating Firefox background.scripts loading).
 const sharedModules = expectedScripts.slice(0, -1); // all except service-worker.js
 for (const mod of sharedModules) {
-  const src = fs.readFileSync(path.join(root, mod), 'utf8');
+  const src = fs.readFileSync(path.join(firefoxRoot, mod), 'utf8');
   vm.runInContext(src, ctx, { filename: mod });
 }
 
@@ -221,9 +293,9 @@ check('BRTrash is defined after shared module loading',
 check('BRMessaging is defined after shared module loading',
   vm.runInContext('typeof BRMessaging', ctx) === 'object', '');
 
-// Now load the entrypoint. Because BRConstants is already defined, the
-// importScripts guard should skip re-importing.
-const swSrc = fs.readFileSync(path.join(root, 'background', 'service-worker.js'), 'utf8');
+// Now load the entrypoint from firefox/. Because BRConstants is already
+// defined, the importScripts guard should skip re-importing.
+const swSrc = fs.readFileSync(path.join(firefoxRoot, 'background', 'service-worker.js'), 'utf8');
 vm.runInContext(swSrc, ctx, { filename: 'background/service-worker.js' });
 
 // Verify listeners were registered.
@@ -237,15 +309,14 @@ check('chrome.runtime.onMessage listener registered',
   listeners.message.some(function (e) { return e.action === 'register'; }),
   'message entries=' + listeners.message.length);
 
-// ---- Part 4: scan-now message through the Firefox-loaded entrypoint --------
-console.log('[Part 4] scan-now message handling');
+// ---- Part 6: scan-now message through Firefox-loaded entrypoint -------------
+console.log('[Part 6] scan-now message handling');
 
-// Find the onMessage listener and invoke it with a scan-now message.
 var messageListener = listeners.message.find(function (e) { return e.action === 'register'; });
 check('message listener found', !!messageListener, '');
 
 if (messageListener) {
-  var settle4 = trackAsync();
+  var settle6 = trackAsync();
   var scanResponse = null;
   var scanDone = false;
   var sender = { id: 'test-extension-id' };
@@ -254,7 +325,6 @@ if (messageListener) {
     scanDone = true;
   };
 
-  // The listener returns true for async responses; we need to wait.
   var returned = messageListener.fn(
     { type: 'scan-now' },
     sender,
@@ -262,7 +332,6 @@ if (messageListener) {
   );
   check('scan-now listener returns true (async response)', returned === true, 'returned=' + returned);
 
-  // Wait for the async scan to complete.
   var waitStart = Date.now();
   var waitMs = 5000;
   function pollScan() {
@@ -273,26 +342,25 @@ if (messageListener) {
           scanResponse.ok === true,
           'ok=' + scanResponse.ok);
       }
-      settle4();
+      settle6();
       return;
     }
     if (Date.now() - waitStart > waitMs) {
       check('scan-now response received within timeout', false,
         'timed out after ' + waitMs + 'ms');
-      settle4();
+      settle6();
       return;
     }
     setTimeout(pollScan, 50);
   }
-  // Give the microtask queue a tick before polling.
   setTimeout(pollScan, 10);
 }
 
-// ---- Part 5: scan-status message through Firefox-loaded entrypoint ---------
-console.log('[Part 5] scan-status message handling');
+// ---- Part 7: scan-status message through Firefox-loaded entrypoint ----------
+console.log('[Part 7] scan-status message handling');
 
 if (messageListener) {
-  var settle5 = trackAsync();
+  var settle7 = trackAsync();
   var statusResponse = null;
   var statusDone = false;
   var statusSender = { id: 'test-extension-id' };
@@ -317,12 +385,12 @@ if (messageListener) {
         check('scan-status response ok is true', statusResponse.ok === true,
           'ok=' + statusResponse.ok);
       }
-      settle5();
+      settle7();
       return;
     }
     if (Date.now() - statusWaitStart > 3000) {
       check('scan-status response received within timeout', false, 'timed out');
-      settle5();
+      settle7();
       return;
     }
     setTimeout(pollStatus, 50);
@@ -330,7 +398,62 @@ if (messageListener) {
   setTimeout(pollStatus, 10);
 }
 
+// ---- Part 8: deterministic mirror-sync test --------------------------------
+console.log('[Part 8] mirror-sync (firefox/ vs extension/)');
+
+// Walk every file under firefox/ and compare to its extension/ counterpart.
+// The ONLY permitted difference is manifest.json (background key).
+function walkDir(dir, prefix) {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    const rel = prefix ? prefix + '/' + entry.name : entry.name;
+    if (entry.isDirectory()) {
+      files.push.apply(files, walkDir(path.join(dir, entry.name), rel));
+    } else {
+      files.push(rel);
+    }
+  }
+  return files;
+}
+
+const firefoxFiles = walkDir(firefoxRoot, '');
+let mirrorDiverged = 0;
+
+for (const rel of firefoxFiles) {
+  const ffPath = path.join(firefoxRoot, rel);
+  const extPath = path.join(extensionRoot, rel);
+
+  if (rel === 'manifest.json') {
+    // Manifest difference is intentional (background key). Verify the
+    // non-background fields still match by comparing a normalized copy.
+    const ffNorm = JSON.parse(JSON.stringify(firefoxManifest));
+    const extNorm = JSON.parse(JSON.stringify(chromeManifest));
+    delete ffNorm.background;
+    delete extNorm.background;
+    check('manifest non-background fields match',
+      JSON.stringify(ffNorm) === JSON.stringify(extNorm),
+      '');
+    continue;
+  }
+
+  if (!fs.existsSync(extPath)) {
+    check('mirror: firefox/' + rel + ' has counterpart in extension/', false,
+      'missing in extension/');
+    mirrorDiverged++;
+    continue;
+  }
+
+  const ffContent = fs.readFileSync(ffPath);
+  const extContent = fs.readFileSync(extPath);
+  const identical = Buffer.compare(ffContent, extContent) === 0;
+  check('mirror: firefox/' + rel + ' identical to extension/' + rel, identical,
+    identical ? '' : 'files differ (' + ffContent.length + ' vs ' + extContent.length + ' bytes)');
+  if (!identical) mirrorDiverged++;
+}
+
+check('mirror-sync: zero unintentional divergences', mirrorDiverged === 0,
+  'diverged=' + mirrorDiverged);
+
 // ---- Summary ---------------------------------------------------------------
-// If no async work was scheduled (messageListener missing), finish immediately.
-// Otherwise finish() is called by the last settle callback.
 if (pending === 0) finish();

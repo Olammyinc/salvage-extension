@@ -8,7 +8,7 @@ Salvage scans your entire bookmark tree and builds a Library Report: total bookm
 
 It also checks dead links if you opt in, and lets you clean up by moving duplicates and dead bookmarks to a Salvage Trash folder instead of deleting them.
 
-**Version 0.2.0** includes:
+**Version 0.2.1** includes:
 
 - Full bookmark tree scan with resumable chunks that survive browser restarts
 - Backup export of your entire bookmark library to JSON
@@ -35,11 +35,11 @@ No AI. No API keys. No search. No payments. The only network requests happen whe
 ### Firefox (temporary add-on)
 
 1. Open `about:debugging#/runtime/this-firefox`.
-2. Click **Load Temporary Add-on...** and pick any file inside `extension/` (like `manifest.json`).
+2. Click **Load Temporary Add-on...** and pick any file inside `firefox/` (like `manifest.json`).
 3. The add-on loads for this session only. It disappears when Firefox restarts -- that's normal temporary add-on behavior.
 4. Click the extension icon and hit **Scan now**.
 
-The same `manifest.json` works for both Chromium and Firefox. It declares `background.service_worker` (used by Chrome/Edge/Brave) and `background.scripts` (used by Firefox). No separate build or package is needed, but you should test on each browser to confirm everything loads.
+Chrome/Edge/Brave load the `extension/` package. Firefox loads the `firefox/` package. The two packages are separate static copies because their MV3 background manifest keys differ: Chromium uses `background.service_worker` while Firefox uses `background.scripts` to load classic scripts in order. Both packages share identical runtime code; only the manifest `background` key differs.
 
 ## How the scan handles browser restarts
 
